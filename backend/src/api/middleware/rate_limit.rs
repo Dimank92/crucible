@@ -7,6 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    net::IpAddr,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -212,6 +213,44 @@ pub struct RateLimitResult {
     pub reset_secs: u64,
 }
 
+/// Determines whether an IP address is a trusted local/private proxy hop.
+pub fn is_trusted_proxy(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local()
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback() || ipv6.is_unique_local() || ipv6.is_unicast_link_local()
+        }
+    }
+}
+
+/// Extract the true client IP from `X-Forwarded-For` by walking from right to left
+/// and skipping trusted proxy hops, preventing client IP spoofing via attacker-prepended IPs.
+pub fn extract_client_ip_from_forwarded(forwarded: &str) -> Option<String> {
+    let ips: Vec<&str> = forwarded
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if ips.is_empty() {
+        return None;
+    }
+
+    // Walk backwards from rightmost proxy hop to leftmost client
+    for &candidate in ips.iter().rev() {
+        if let Ok(ip_addr) = candidate.parse::<IpAddr>() {
+            if !is_trusted_proxy(&ip_addr) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    // If all hops are private/trusted proxies, return the rightmost hop
+    ips.last().map(|s| s.to_string())
+}
+
 /// Extract rate limiting key (API Key token or IP address) from request headers
 pub fn extract_rate_limit_key(headers: &HeaderMap) -> String {
     // 1. Check API Key header
@@ -231,13 +270,10 @@ pub fn extract_rate_limit_key(headers: &HeaderMap) -> String {
         }
     }
 
-    // 3. Check X-Forwarded-For header (first client IP)
+    // 3. Check X-Forwarded-For header (rightmost untrusted client IP)
     if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
-        if let Some(first_ip) = forwarded.split(',').next() {
-            let ip = first_ip.trim();
-            if !ip.is_empty() {
-                return format!("ip:{}", ip);
-            }
+        if let Some(client_ip) = extract_client_ip_from_forwarded(forwarded) {
+            return format!("ip:{}", client_ip);
         }
     }
 
@@ -328,14 +364,38 @@ mod tests {
         headers.insert("x-real-ip", HeaderValue::from_static("192.168.1.1"));
         assert_eq!(extract_rate_limit_key(&headers), "ip:192.168.1.1");
 
-        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1, 10.0.0.2"));
-        assert_eq!(extract_rate_limit_key(&headers), "ip:10.0.0.1");
+        headers.insert("x-forwarded-for", HeaderValue::from_static("1.1.1.1, 203.0.113.195, 10.0.0.1"));
+        assert_eq!(extract_rate_limit_key(&headers), "ip:203.0.113.195");
 
         headers.insert("authorization", HeaderValue::from_static("Bearer secret-jwt"));
         assert_eq!(extract_rate_limit_key(&headers), "token:secret-jwt");
 
         headers.insert("x-api-key", HeaderValue::from_static("api-key-123"));
         assert_eq!(extract_rate_limit_key(&headers), "token:api-key-123");
+    }
+
+    #[test]
+    fn test_extract_client_ip_from_forwarded_spoofing_prevention() {
+        // Attacker attempts to spoof 1.1.1.1 by prepending it; LB at 10.0.0.1 appends real client 198.51.100.55
+        let forwarded = "1.1.1.1, 198.51.100.55, 10.0.0.1";
+        assert_eq!(
+            extract_client_ip_from_forwarded(forwarded),
+            Some("198.51.100.55".to_string())
+        );
+
+        // Multiple private proxy hops
+        let chain = "spoofed.ip, 203.0.113.88, 172.16.1.1, 127.0.0.1";
+        assert_eq!(
+            extract_client_ip_from_forwarded(chain),
+            Some("203.0.113.88".to_string())
+        );
+
+        // All private hops fallback to rightmost
+        let private_chain = "10.0.0.1, 192.168.1.1";
+        assert_eq!(
+            extract_client_ip_from_forwarded(private_chain),
+            Some("192.168.1.1".to_string())
+        );
     }
 
     #[tokio::test]
