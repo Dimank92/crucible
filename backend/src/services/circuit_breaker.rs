@@ -22,12 +22,14 @@ pub enum CircuitState {
 /// Configuration for a circuit breaker.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
-    /// Number of consecutive failures before opening the circuit.
+    /// Number of failures within the failure window before opening the circuit.
     pub failure_threshold: u32,
     /// How long to wait in Open state before transitioning to HalfOpen.
     pub recovery_timeout: Duration,
     /// Number of consecutive successes in HalfOpen before closing.
     pub success_threshold: u32,
+    /// Sliding time window during which failures are tracked.
+    pub failure_window: Duration,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -36,6 +38,7 @@ impl Default for CircuitBreakerConfig {
             failure_threshold: 5,
             recovery_timeout: Duration::from_secs(30),
             success_threshold: 2,
+            failure_window: Duration::from_secs(60),
         }
     }
 }
@@ -43,7 +46,7 @@ impl Default for CircuitBreakerConfig {
 #[derive(Debug)]
 struct CircuitBreakerInner {
     state: CircuitState,
-    consecutive_failures: u32,
+    failure_timestamps: Vec<Instant>,
     consecutive_successes: u32,
     config: CircuitBreakerConfig,
 }
@@ -52,10 +55,18 @@ impl CircuitBreakerInner {
     fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             state: CircuitState::Closed,
-            consecutive_failures: 0,
+            failure_timestamps: Vec::new(),
             consecutive_successes: 0,
             config,
         }
+    }
+
+    fn prune_failures(&mut self, now: Instant) {
+        let window = self.config.failure_window;
+        self.failure_timestamps.retain(|&t| {
+            now.checked_duration_since(t)
+                .map_or(true, |elapsed| elapsed <= window)
+        });
     }
 
     fn is_request_allowed(&mut self) -> bool {
@@ -81,35 +92,38 @@ impl CircuitBreakerInner {
                 self.consecutive_successes += 1;
                 if self.consecutive_successes >= self.config.success_threshold {
                     self.state = CircuitState::Closed;
-                    self.consecutive_failures = 0;
+                    self.failure_timestamps.clear();
                     info!("Circuit breaker closed after successful recovery");
                 }
             }
             CircuitState::Closed => {
-                self.consecutive_failures = 0;
+                // Prune expired failures from sliding window, but do not
+                // clear unexpired failures on an isolated single success.
+                self.prune_failures(Instant::now());
             }
             _ => {}
         }
     }
 
     fn record_failure(&mut self) {
-        self.consecutive_failures += 1;
+        let now = Instant::now();
+        self.prune_failures(now);
+        self.failure_timestamps.push(now);
+
         match self.state {
             CircuitState::Closed => {
-                if self.consecutive_failures >= self.config.failure_threshold {
-                    self.state = CircuitState::Open {
-                        opened_at: Instant::now(),
-                    };
+                let failure_count = self.failure_timestamps.len() as u32;
+                if failure_count >= self.config.failure_threshold {
+                    self.state = CircuitState::Open { opened_at: now };
                     warn!(
-                        failures = self.consecutive_failures,
+                        failures = failure_count,
                         "Circuit breaker opened after threshold exceeded"
                     );
                 }
             }
             CircuitState::HalfOpen => {
-                self.state = CircuitState::Open {
-                    opened_at: Instant::now(),
-                };
+                self.state = CircuitState::Open { opened_at: now };
+                self.consecutive_successes = 0;
                 warn!("Circuit breaker re-opened after probe failure");
             }
             _ => {}
@@ -173,6 +187,13 @@ impl CircuitBreaker {
             CircuitState::HalfOpen => "half_open",
         }
     }
+
+    /// Returns the number of unexpired failures in the sliding window.
+    pub async fn failure_count(&self) -> usize {
+        let mut inner = self.inner.write().await;
+        inner.prune_failures(Instant::now());
+        inner.failure_timestamps.len()
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +205,7 @@ mod tests {
             failure_threshold: 3,
             recovery_timeout: Duration::from_millis(50),
             success_threshold: 1,
+            failure_window: Duration::from_secs(60),
         }
     }
 
@@ -223,5 +245,75 @@ mod tests {
             let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
         }
         assert_eq!(cb.state_label().await, "open");
+    }
+
+    #[tokio::test]
+    async fn test_fluttering_failures_trip_breaker_sliding_window() {
+        let cb = CircuitBreaker::new("test", fast_config());
+        // Fail twice
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        assert_eq!(cb.failure_count().await, 2);
+
+        // A single success should NOT reset failure history in Closed state
+        let ok_res = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(ok_res.is_ok());
+        assert_eq!(cb.failure_count().await, 2);
+
+        // Third failure within the sliding window should trip the breaker to Open
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        assert_eq!(cb.state_label().await, "open");
+
+        // Subsequent call is rejected by open circuit breaker
+        let blocked = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(matches!(blocked, Err(CircuitBreakerError::Open(_))));
+    }
+
+    #[tokio::test]
+    async fn test_failures_expire_outside_sliding_window() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            recovery_timeout: Duration::from_millis(50),
+            success_threshold: 1,
+            failure_window: Duration::from_millis(60),
+        };
+        let cb = CircuitBreaker::new("test", config);
+
+        // Two failures
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        assert_eq!(cb.failure_count().await, 2);
+
+        // Wait for sliding window to expire
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // A success or failure now prunes expired failures
+        let ok_res = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(ok_res.is_ok());
+        assert_eq!(cb.failure_count().await, 0);
+
+        // A subsequent failure only has count 1, does not trip
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        assert_eq!(cb.failure_count().await, 1);
+        assert_eq!(cb.state_label().await, "closed");
+    }
+
+    #[tokio::test]
+    async fn test_recovery_clears_sliding_window() {
+        let cb = CircuitBreaker::new("test", fast_config());
+        // Trip breaker
+        for _ in 0..3 {
+            let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        }
+        assert_eq!(cb.state_label().await, "open");
+
+        // Wait for recovery timeout
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Successful probe resets circuit to closed and clears failure window
+        let probe = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(probe.is_ok());
+        assert_eq!(cb.state_label().await, "closed");
+        assert_eq!(cb.failure_count().await, 0);
     }
 }
