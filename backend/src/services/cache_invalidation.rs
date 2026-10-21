@@ -60,6 +60,13 @@ pub struct CacheInvalidationConfig {
     pub retry_attempts: u8,
     /// Delay between retries in milliseconds
     pub retry_delay_ms: u64,
+    /// Batch size for non-blocking SCAN iteration
+    #[serde(default = "default_scan_batch_size")]
+    pub scan_batch_size: usize,
+}
+
+fn default_scan_batch_size() -> usize {
+    250
 }
 
 impl Default for CacheInvalidationConfig {
@@ -70,6 +77,7 @@ impl Default for CacheInvalidationConfig {
             timeout_ms: 5000,
             retry_attempts: 3,
             retry_delay_ms: 100,
+            scan_batch_size: default_scan_batch_size(),
         }
     }
 }
@@ -120,21 +128,38 @@ impl CacheInvalidationManager {
         Ok(())
     }
 
-    /// Invalidate keys matching a pattern
+    /// Invalidate keys matching a pattern using non-blocking SCAN iteration
     pub async fn invalidate_pattern(&self, pattern: &str) -> Result<(), anyhow::Error> {
         let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        
-        // Get all keys matching the pattern
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(pattern)
-            .query_async(&mut conn)
-            .await?;
-        
-        if !keys.is_empty() {
-            self.invalidate_keys(keys.clone()).await?;
-            info!(pattern = %pattern, count = keys.len(), "Invalidated keys by pattern");
+        let batch_size = self.config.scan_batch_size;
+        let mut cursor = 0_u64;
+        let mut total_invalidated = 0_usize;
+
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(batch_size as u32)
+                .query_async(&mut conn)
+                .await?;
+
+            if !keys.is_empty() {
+                total_invalidated += keys.len();
+                self.invalidate_keys(keys).await?;
+            }
+
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
         }
-        
+
+        if total_invalidated > 0 {
+            info!(pattern = %pattern, count = total_invalidated, "Invalidated keys by pattern via SCAN");
+        }
+
         Ok(())
     }
 
@@ -222,7 +247,7 @@ impl CacheInvalidationManager {
     ) -> Result<(), anyhow::Error> {
         let mut attempts = 0;
         loop {
-            match Self::invalidate_patterns_impl(redis_client, patterns.to_vec()).await {
+            match Self::invalidate_patterns_impl(redis_client, patterns.to_vec(), config).await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     attempts += 1;
@@ -243,7 +268,7 @@ impl CacheInvalidationManager {
     ) -> Result<(), anyhow::Error> {
         let mut attempts = 0;
         loop {
-            match Self::invalidate_namespaces_impl(redis_client, namespaces.to_vec()).await {
+            match Self::invalidate_namespaces_impl(redis_client, namespaces.to_vec(), config).await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     attempts += 1;
@@ -297,18 +322,31 @@ impl CacheInvalidationManager {
     async fn invalidate_patterns_impl(
         redis_client: &Arc<redis::Client>,
         patterns: Vec<String>,
+        config: &CacheInvalidationConfig,
     ) -> Result<(), anyhow::Error> {
+        let batch_size = config.scan_batch_size;
         for pattern in &patterns {
             let mut conn = redis_client.get_multiplexed_async_connection().await?;
-            
-            // Get all keys matching the pattern
-            let keys: Vec<String> = redis::cmd("KEYS")
-                .arg(pattern)
-                .query_async(&mut conn)
-                .await?;
-            
-            if !keys.is_empty() {
-                Self::invalidate_keys_impl(redis_client, keys).await?;
+            let mut cursor = 0_u64;
+
+            loop {
+                let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(pattern)
+                    .arg("COUNT")
+                    .arg(batch_size as u32)
+                    .query_async(&mut conn)
+                    .await?;
+
+                if !keys.is_empty() {
+                    Self::invalidate_keys_impl(redis_client, keys).await?;
+                }
+
+                if next_cursor == 0 {
+                    break;
+                }
+                cursor = next_cursor;
             }
         }
         Ok(())
@@ -317,10 +355,11 @@ impl CacheInvalidationManager {
     async fn invalidate_namespaces_impl(
         redis_client: &Arc<redis::Client>,
         namespaces: Vec<String>,
+        config: &CacheInvalidationConfig,
     ) -> Result<(), anyhow::Error> {
         for namespace in &namespaces {
             let pattern = format!("{}:*", namespace);
-            Self::invalidate_patterns_impl(redis_client, vec![pattern]).await?;
+            Self::invalidate_patterns_impl(redis_client, vec![pattern], config).await?;
         }
         Ok(())
     }
@@ -442,20 +481,37 @@ impl SimulationCacheManager {
         }
     }
 
-    /// Invalidate simulation cache entries when a ledger modifies the target contract footprint.
+    /// Invalidate simulation cache entries when a ledger modifies the target contract footprint
+    /// using non-blocking SCAN iteration to avoid blocking the Redis event loop.
     pub async fn invalidate_contract_footprint(&self, contract_id: &str) -> Result<(), anyhow::Error> {
         info!(contract_id = %contract_id, "Invalidating simulation cache for updated contract footprint");
         
         let pattern = format!("sim:{}*", contract_id);
         let mut conn = self.redis_client.get_multiplexed_async_connection().await?;
-        let keys: Vec<String> = redis::cmd("KEYS").arg(&pattern).query_async(&mut conn).await?;
+        let mut cursor = 0_u64;
 
-        for key in &keys {
-            self.moka_cache.invalidate(key).await;
-        }
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(250_u32)
+                .query_async(&mut conn)
+                .await?;
 
-        if !keys.is_empty() {
-            redis::cmd("DEL").arg(&keys).query_async::<()>(&mut conn).await?;
+            for key in &keys {
+                self.moka_cache.invalidate(key).await;
+            }
+
+            if !keys.is_empty() {
+                redis::cmd("DEL").arg(&keys).query_async::<()>(&mut conn).await?;
+            }
+
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
         }
 
         Ok(())
@@ -523,5 +579,20 @@ mod tests {
         assert!(hit_res.is_some());
         assert_eq!(hit_res.unwrap().cpu_instructions, 150_000);
         assert!(hit_duration < miss_duration + Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidation_config_scan_batch_size() {
+        let default_config = CacheInvalidationConfig::default();
+        assert_eq!(default_config.scan_batch_size, 250);
+
+        let custom_json = r#"{"background_processing":false,"max_concurrent":5,"timeout_ms":1000,"retry_attempts":2,"retry_delay_ms":50,"scan_batch_size":500}"#;
+        let parsed: CacheInvalidationConfig = serde_json::from_str(custom_json).unwrap();
+        assert_eq!(parsed.scan_batch_size, 500);
+
+        // Deserializing legacy JSON without scan_batch_size should fall back to default
+        let legacy_json = r#"{"background_processing":false,"max_concurrent":5,"timeout_ms":1000,"retry_attempts":2,"retry_delay_ms":50}"#;
+        let parsed_legacy: CacheInvalidationConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed_legacy.scan_batch_size, 250);
     }
 }
