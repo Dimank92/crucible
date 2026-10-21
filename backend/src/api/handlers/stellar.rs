@@ -11,11 +11,61 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{error, info, info_span, instrument, warn};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StellarMemoType {
+    Text,
+    Id,
+    Hash,
+}
+
+/// Validates Stellar transaction memos:
+/// - Text memo: maximum 28 UTF-8 bytes.
+/// - Id memo: valid 64-bit unsigned integer (`u64`).
+/// - Hash memo: 32-byte hash (64 hex characters).
+pub fn validate_stellar_memo(
+    memo: &str,
+    memo_type: Option<StellarMemoType>,
+) -> Result<(), (StatusCode, String)> {
+    match memo_type {
+        Some(StellarMemoType::Text) | None => {
+            let byte_len = memo.as_bytes().len();
+            if byte_len > 28 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Stellar text memo exceeds 28-byte limit (got {} bytes).", byte_len),
+                ));
+            }
+        }
+        Some(StellarMemoType::Id) => {
+            if memo.parse::<u64>().is_err() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid Stellar memo ID. Must be a valid 64-bit unsigned integer.".to_string(),
+                ));
+            }
+        }
+        Some(StellarMemoType::Hash) => {
+            if memo.len() != 64 || !memo.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid Stellar memo hash. Must be a 32-byte hex-encoded string (64 characters).".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FundAccountRequest {
     pub destination: String,
     #[serde(default)]
     pub amount_xlm: Option<Decimal>,
+    #[serde(default)]
+    pub memo: Option<String>,
+    #[serde(default)]
+    pub memo_type: Option<StellarMemoType>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,6 +77,8 @@ pub struct FundAccountResponse {
     pub pool_remaining_balance: Decimal,
     pub dispenser_source: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +166,8 @@ impl FaucetDispenserService {
         destination: &str,
         client_ip: &str,
         requested_amount: Option<Decimal>,
+        memo: Option<String>,
+        memo_type: Option<StellarMemoType>,
     ) -> Result<FundAccountResponse, (StatusCode, String)> {
         // Validate destination Stellar address
         if !destination.starts_with('G') || destination.len() != 56 {
@@ -121,6 +175,11 @@ impl FaucetDispenserService {
                 StatusCode::BAD_REQUEST,
                 "Invalid Stellar testnet public key. Must start with 'G' and be 56 characters.".to_string(),
             ));
+        }
+
+        // Validate Stellar transaction memo
+        if let Some(ref m) = memo {
+            validate_stellar_memo(m, memo_type)?;
         }
 
         // Check rate limit per IP and per destination account
@@ -154,15 +213,31 @@ impl FaucetDispenserService {
 
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}:{}:{}", destination, client_ip, Instant::now().elapsed().as_nanos()).as_bytes());
+        let memo_repr = memo.as_deref().unwrap_or("");
+        hasher.update(
+            format!(
+                "{}:{}:{}:{}",
+                destination,
+                client_ip,
+                memo_repr,
+                Instant::now().elapsed().as_nanos()
+            )
+            .as_bytes(),
+        );
         let tx_hash = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
         info!(
             destination,
             amount = %dispense_amount,
             tx_hash = %tx_hash,
+            memo = ?memo,
             "Dispensed testnet XLM to account"
         );
+
+        let message = match &memo {
+            Some(m) => format!("Successfully funded {} XLM to {} (memo: {})", dispense_amount, destination, m),
+            None => format!("Successfully funded {} XLM to {}", dispense_amount, destination),
+        };
 
         Ok(FundAccountResponse {
             success: true,
@@ -171,7 +246,8 @@ impl FaucetDispenserService {
             amount_dispensed: dispense_amount,
             pool_remaining_balance: remaining,
             dispenser_source: source,
-            message: format!("Successfully funded {} XLM to {}", dispense_amount, destination),
+            message,
+            memo,
         })
     }
 }
@@ -213,7 +289,15 @@ pub async fn dispense_faucet_handler(
     Json(payload): Json<FundAccountRequest>,
 ) -> Result<Json<FundAccountResponse>, (StatusCode, String)> {
     let client_ip = "127.0.0.1";
-    let res = service.dispense(&payload.destination, client_ip, payload.amount_xlm).await?;
+    let res = service
+        .dispense(
+            &payload.destination,
+            client_ip,
+            payload.amount_xlm,
+            payload.memo,
+            payload.memo_type,
+        )
+        .await?;
     Ok(Json(res))
 }
 
@@ -241,7 +325,15 @@ pub async fn fund_testnet_account(
         .trim();
 
     let pool = get_faucet_pool();
-    let res = pool.dispense(&payload.destination, client_ip, payload.amount_xlm).await?;
+    let res = pool
+        .dispense(
+            &payload.destination,
+            client_ip,
+            payload.amount_xlm,
+            payload.memo,
+            payload.memo_type,
+        )
+        .await?;
     Ok((StatusCode::OK, Json(res)))
 }
 
@@ -267,7 +359,7 @@ mod tests {
     async fn test_dispense_testnet_account_success() {
         let service = FaucetDispenserService::new();
         let valid_destination = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
-        let res = service.dispense(valid_destination, "192.168.1.10", Some(Decimal::new(50, 0))).await.unwrap();
+        let res = service.dispense(valid_destination, "192.168.1.10", Some(Decimal::new(50, 0)), None, None).await.unwrap();
 
         assert!(res.success);
         assert_eq!(res.funded_account, valid_destination);
@@ -282,17 +374,17 @@ mod tests {
         let ip = "10.0.0.5";
 
         for _ in 0..5 {
-            let res = service.dispense(valid_dest, ip, None).await;
+            let res = service.dispense(valid_dest, ip, None, None, None).await;
             assert!(res.is_ok());
         }
 
         // 6th request from same IP within window must fail with 429
-        let err = service.dispense(valid_dest, ip, None).await.unwrap_err();
+        let err = service.dispense(valid_dest, ip, None, None, None).await.unwrap_err();
         assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
 
         // Different IP and destination must still succeed
         let other_dest = "GCARU656RHO62CJJUXOG4YJ4V5W266OFEQ3Q4U6V5B6AUPY7V7S6TEST";
-        let other_ip_res = service.dispense(other_dest, "10.0.0.6", None).await;
+        let other_ip_res = service.dispense(other_dest, "10.0.0.6", None, None, None).await;
         assert!(other_ip_res.is_ok());
     }
 
@@ -303,19 +395,19 @@ mod tests {
 
         for i in 0..5 {
             let ip = format!("10.0.1.{}", i);
-            let res = service.dispense(valid_dest, &ip, None).await;
+            let res = service.dispense(valid_dest, &ip, None, None, None).await;
             assert!(res.is_ok());
         }
 
         // 6th request to same destination account within window must fail with 429 even from a new IP
-        let err = service.dispense(valid_dest, "10.0.1.99", None).await.unwrap_err();
+        let err = service.dispense(valid_dest, "10.0.1.99", None, None, None).await.unwrap_err();
         assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
     async fn test_invalid_destination_rejection() {
         let service = FaucetDispenserService::new();
-        let err = service.dispense("INVALID_KEY", "127.0.0.1", None).await.unwrap_err();
+        let err = service.dispense("INVALID_KEY", "127.0.0.1", None, None, None).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -329,7 +421,7 @@ mod tests {
             let ip = format!("172.16.0.{}", i);
             let handle = tokio::spawn(async move {
                 let dest = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
-                svc.dispense(dest, &ip, Some(Decimal::new(10, 0))).await
+                svc.dispense(dest, &ip, Some(Decimal::new(10, 0)), None, None).await
             });
             handles.push(handle);
         }
@@ -350,5 +442,125 @@ mod tests {
         service.replenish_pool(Decimal::new(5000, 0)).await;
         let after_stats = service.get_stats().await;
         assert_eq!(after_stats.balance_xlm, initial_stats.balance_xlm + Decimal::new(5000, 0));
+    }
+
+    #[tokio::test]
+    async fn test_dispense_with_valid_text_memo() {
+        let service = FaucetDispenserService::new();
+        let valid_destination = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
+        let res = service
+            .dispense(
+                valid_destination,
+                "192.168.1.20",
+                Some(Decimal::new(50, 0)),
+                Some("order-12345".to_string()),
+                Some(StellarMemoType::Text),
+            )
+            .await
+            .unwrap();
+
+        assert!(res.success);
+        assert_eq!(res.memo, Some("order-12345".to_string()));
+        assert!(res.message.contains("memo: order-12345"));
+    }
+
+    #[tokio::test]
+    async fn test_dispense_with_oversized_text_memo() {
+        let service = FaucetDispenserService::new();
+        let valid_destination = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
+        // 29 bytes: exceeds 28-byte limit
+        let long_memo = "12345678901234567890123456789";
+        assert_eq!(long_memo.len(), 29);
+
+        let err = service
+            .dispense(
+                valid_destination,
+                "192.168.1.21",
+                Some(Decimal::new(50, 0)),
+                Some(long_memo.to_string()),
+                Some(StellarMemoType::Text),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("28-byte limit"));
+    }
+
+    #[tokio::test]
+    async fn test_dispense_with_valid_id_memo() {
+        let service = FaucetDispenserService::new();
+        let valid_destination = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
+        let res = service
+            .dispense(
+                valid_destination,
+                "192.168.1.22",
+                Some(Decimal::new(50, 0)),
+                Some("9876543210".to_string()),
+                Some(StellarMemoType::Id),
+            )
+            .await
+            .unwrap();
+
+        assert!(res.success);
+        assert_eq!(res.memo, Some("9876543210".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_dispense_with_invalid_id_memo() {
+        let service = FaucetDispenserService::new();
+        let valid_destination = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
+        let err = service
+            .dispense(
+                valid_destination,
+                "192.168.1.23",
+                Some(Decimal::new(50, 0)),
+                Some("not-a-number".to_string()),
+                Some(StellarMemoType::Id),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("Invalid Stellar memo ID"));
+    }
+
+    #[tokio::test]
+    async fn test_dispense_with_valid_hash_memo() {
+        let service = FaucetDispenserService::new();
+        let valid_destination = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
+        let valid_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let res = service
+            .dispense(
+                valid_destination,
+                "192.168.1.24",
+                Some(Decimal::new(50, 0)),
+                Some(valid_hash.to_string()),
+                Some(StellarMemoType::Hash),
+            )
+            .await
+            .unwrap();
+
+        assert!(res.success);
+        assert_eq!(res.memo, Some(valid_hash.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_dispense_with_invalid_hash_memo() {
+        let service = FaucetDispenserService::new();
+        let valid_destination = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
+        let err = service
+            .dispense(
+                valid_destination,
+                "192.168.1.25",
+                Some(Decimal::new(50, 0)),
+                Some("too_short_hash".to_string()),
+                Some(StellarMemoType::Hash),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("Invalid Stellar memo hash"));
     }
 }
