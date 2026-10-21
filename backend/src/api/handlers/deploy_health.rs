@@ -45,6 +45,33 @@ pub struct DeployHealthState {
     pub redis: redis::aio::ConnectionManager,
 }
 
+/// Verifies database write capability for deployment readiness probes.
+///
+/// Executes a lightweight transaction check confirming the database is neither
+/// in read-only standby mode nor configured with `transaction_read_only = on`.
+pub async fn check_database_write_capability(pool: &PgPool) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from)?;
+    let (is_in_recovery, is_read_only): (bool, String) = sqlx::query_as(
+        "SELECT pg_is_in_recovery(), current_setting('transaction_read_only')"
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::from)?;
+
+    if is_in_recovery {
+        let _ = tx.rollback().await;
+        return Err(AppError::InternalError("database is in read-only standby mode".into()));
+    }
+
+    if is_read_only.eq_ignore_ascii_case("on") || is_read_only.eq_ignore_ascii_case("true") {
+        let _ = tx.rollback().await;
+        return Err(AppError::InternalError("database transaction_read_only is active".into()));
+    }
+
+    tx.commit().await.map_err(AppError::from)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------

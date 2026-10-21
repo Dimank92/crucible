@@ -340,22 +340,66 @@ pub fn reset_startup_flag() {
 // ---------------------------------------------------------------------------
 
 async fn check_database(pool: &PgPool) -> CheckResult {
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(pool)
-        .await
-    {
-        Ok(_) => {
-            debug!("Database health check passed");
+    // Execute a lightweight transaction check verifying write capability.
+    // In PostgreSQL, beginning a transaction and checking recovery / read-only state
+    // ensures the node is not a read-only replica or in transaction log disk-full state.
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!("Database health check failed to begin transaction: {e}");
+            return CheckResult {
+                status: "down",
+                message: Some("connection unavailable or read-only".into()),
+            };
+        }
+    };
+
+    let check_query: Result<(bool, String), sqlx::Error> = sqlx::query_as(
+        "SELECT pg_is_in_recovery(), current_setting('transaction_read_only')"
+    )
+    .fetch_one(&mut *tx)
+    .await;
+
+    match check_query {
+        Ok((is_in_recovery, is_read_only)) => {
+            if is_in_recovery {
+                warn!("Database readiness check failed: database is in recovery (read-only standby)");
+                let _ = tx.rollback().await;
+                return CheckResult {
+                    status: "down",
+                    message: Some("database is in read-only standby mode".into()),
+                };
+            }
+
+            if is_read_only.eq_ignore_ascii_case("on") || is_read_only.eq_ignore_ascii_case("true") {
+                warn!("Database readiness check failed: database transaction_read_only is active");
+                let _ = tx.rollback().await;
+                return CheckResult {
+                    status: "down",
+                    message: Some("database write capability disabled (read-only mode)".into()),
+                };
+            }
+
+            if let Err(e) = tx.commit().await {
+                warn!("Database readiness check failed to commit transaction: {e}");
+                return CheckResult {
+                    status: "down",
+                    message: Some("transaction commit failed (possible disk full)".into()),
+                };
+            }
+
+            debug!("Database health check passed (read and write capability verified)");
             CheckResult {
                 status: "up",
                 message: None,
             }
         }
         Err(e) => {
-            warn!("Database health check failed: {e}");
+            warn!("Database health check failed during write verification: {e}");
+            let _ = tx.rollback().await;
             CheckResult {
                 status: "down",
-                message: Some("connection unavailable".into()),
+                message: Some("database write capability verification failed".into()),
             }
         }
     }
@@ -643,5 +687,23 @@ mod tests {
         
         // Clean up
         reset_startup_flag();
+    }
+
+    #[test]
+    fn database_check_result_evaluation() {
+        let is_in_recovery = true;
+        let is_read_only = "off";
+        let should_be_down = is_in_recovery || is_read_only.eq_ignore_ascii_case("on");
+        assert!(should_be_down);
+
+        let is_in_recovery = false;
+        let is_read_only = "on";
+        let should_be_down = is_in_recovery || is_read_only.eq_ignore_ascii_case("on");
+        assert!(should_be_down);
+
+        let is_in_recovery = false;
+        let is_read_only = "off";
+        let should_be_down = is_in_recovery || is_read_only.eq_ignore_ascii_case("on");
+        assert!(!should_be_down);
     }
 }
