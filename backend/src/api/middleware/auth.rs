@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -142,8 +142,7 @@ impl AdminAuthState {
             }
             _ => {
                 warn!(
-                    "ADMIN_API_TOKEN is not set; privileged admin/config endpoints \
-                     are locked down and will reject all requests"
+                    "ADMIN_API_TOKEN is not set; privileged admin/config endpoints                      are locked down and will reject all requests"
                 );
             }
         }
@@ -205,19 +204,70 @@ impl AdminAuthState {
     }
 }
 
-/// Extract the bearer token from the `Authorization` header, if well-formed.
-fn bearer_token(request: &Request) -> Option<String> {
-    let value = request.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    let token = value.strip_prefix("Bearer ")?.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
+/// Errors that can occur when extracting or validating the `Authorization` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthHeaderError {
+    /// The Authorization header was missing from the request.
+    Missing,
+    /// The Authorization header contained non-ASCII / invalid character bytes.
+    NonAscii,
+    /// The Authorization header was missing the required `Bearer ` prefix.
+    MissingBearerPrefix,
+    /// The Bearer token was empty or contained only whitespace.
+    EmptyToken,
+}
+
+impl std::fmt::Display for AuthHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "Authentication required: missing Authorization header"),
+            Self::NonAscii => write!(
+                f,
+                "Malformed Authorization header: contains non-ASCII characters"
+            ),
+            Self::MissingBearerPrefix => {
+                write!(f, "Malformed Authorization header: missing 'Bearer ' prefix")
+            }
+            Self::EmptyToken => write!(f, "Malformed Authorization header: empty bearer token"),
+        }
     }
 }
 
+impl std::error::Error for AuthHeaderError {}
+
+/// Gracefully extract the bearer token from the `Authorization` header, returning
+/// a descriptive [`AuthHeaderError`] if the header is malformed.
+pub fn extract_bearer_token(request: &Request) -> Result<String, AuthHeaderError> {
+    let header_value = match request.headers().get(header::AUTHORIZATION) {
+        Some(val) => val,
+        None => return Err(AuthHeaderError::Missing),
+    };
+
+    let header_str = match header_value.to_str() {
+        Ok(s) => s,
+        Err(_) => return Err(AuthHeaderError::NonAscii),
+    };
+
+    let trimmed = header_str.trim();
+    if !trimmed.starts_with("Bearer ") {
+        return Err(AuthHeaderError::MissingBearerPrefix);
+    }
+
+    let token = trimmed["Bearer ".len()..].trim();
+    if token.is_empty() {
+        return Err(AuthHeaderError::EmptyToken);
+    }
+
+    Ok(token.to_string())
+}
+
+/// Extract the bearer token from the `Authorization` header, if well-formed.
+fn bearer_token(request: &Request) -> Option<String> {
+    extract_bearer_token(request).ok()
+}
+
 fn reject(status: StatusCode, code: &str, message: &str) -> Response {
-    crate::api::errors::make_error_response(status, code, message)
+    crate::api::errors::make_problem_response(status, code, message)
 }
 
 fn b64url_decode(input: &str) -> Option<Vec<u8>> {
@@ -299,13 +349,30 @@ pub async fn require_admin_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(token) = bearer_token(&request) else {
-        debug!("Privileged request rejected: missing bearer token");
-        return reject(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Authentication required: provide a Bearer token",
-        );
+    let token = match extract_bearer_token(&request) {
+        Ok(t) => t,
+        Err(err) => {
+            warn!(error = %err, "Privileged request rejected: malformed or missing authorization header");
+            let (code, message) = match err {
+                AuthHeaderError::Missing => (
+                    "unauthorized",
+                    "Authentication required: provide a Bearer token",
+                ),
+                AuthHeaderError::NonAscii => (
+                    "invalid_authorization_header",
+                    "Malformed Authorization header: contains non-ASCII characters",
+                ),
+                AuthHeaderError::MissingBearerPrefix => (
+                    "invalid_authorization_header",
+                    "Malformed Authorization header: expected 'Bearer <token>'",
+                ),
+                AuthHeaderError::EmptyToken => (
+                    "invalid_authorization_header",
+                    "Malformed Authorization header: empty bearer token",
+                ),
+            };
+            return reject(StatusCode::UNAUTHORIZED, code, message);
+        }
     };
 
     // Static registry tokens (provisioned via env) take precedence.
@@ -393,17 +460,18 @@ mod tests {
         )
     }
 
-    async fn status_for(auth_header: Option<&str>) -> StatusCode {
+    async fn response_for(auth_header: Option<HeaderValue>) -> Response {
         let mut builder = Request::builder().uri("/admin");
         if let Some(value) = auth_header {
             builder = builder.header(header::AUTHORIZATION, value);
         }
         let request = builder.body(Body::empty()).unwrap();
-        guarded_app(registry())
-            .oneshot(request)
-            .await
-            .unwrap()
-            .status()
+        guarded_app(registry()).oneshot(request).await.unwrap()
+    }
+
+    async fn status_for(auth_header: Option<&str>) -> StatusCode {
+        let header_val = auth_header.map(|s| HeaderValue::from_str(s).unwrap());
+        response_for(header_val).await.status()
     }
 
     fn sign_jwt(secret: &str, payload_json: &str) -> String {
@@ -419,14 +487,42 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_request_is_rejected() {
-        assert_eq!(status_for(None).await, StatusCode::UNAUTHORIZED);
+        let resp = response_for(None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
     }
 
     #[tokio::test]
     async fn malformed_header_is_rejected() {
+        let resp = response_for(Some(HeaderValue::from_static("Basic abc"))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            status_for(Some("Basic abc")).await,
-            StatusCode::UNAUTHORIZED
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_header_with_non_ascii_is_rejected() {
+        let non_ascii_val = HeaderValue::from_bytes(b"Bearer ÿþ").unwrap();
+        let resp = response_for(Some(non_ascii_val)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_header_with_empty_token_is_rejected() {
+        let resp = response_for(Some(HeaderValue::from_static("Bearer   "))).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
         );
     }
 
@@ -440,9 +536,11 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_token_is_forbidden() {
+        let resp = response_for(Some(HeaderValue::from_static("Bearer operator-secret"))).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(
-            status_for(Some("Bearer operator-secret")).await,
-            StatusCode::FORBIDDEN
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
         );
     }
 
@@ -451,6 +549,54 @@ mod tests {
         assert_eq!(
             status_for(Some("Bearer admin-secret")).await,
             StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn extract_bearer_token_variants() {
+        let req_valid = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer test-token-123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_valid),
+            Ok("test-token-123".to_string())
+        );
+
+        let req_missing = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_missing),
+            Err(AuthHeaderError::Missing)
+        );
+
+        let req_non_ascii = Request::builder()
+            .header(
+                header::AUTHORIZATION,
+                HeaderValue::from_bytes(b"Bearer ").unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_non_ascii),
+            Err(AuthHeaderError::NonAscii)
+        );
+
+        let req_basic = Request::builder()
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_basic),
+            Err(AuthHeaderError::MissingBearerPrefix)
+        );
+
+        let req_empty = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer   ")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_bearer_token(&req_empty),
+            Err(AuthHeaderError::EmptyToken)
         );
     }
 
