@@ -43,14 +43,16 @@ impl EventIndexer {
         Self { db }
     }
 
-    /// Ingest a batch of raw events from the Stellar network.
+    /// Insert a batch of raw events in an atomic database transaction.
     #[instrument(skip(self, events), fields(count = events.len()))]
-    pub async fn ingest(&self, events: Vec<RawEvent>) -> Result<usize, sqlx::Error> {
+    pub async fn insert_batch(&self, events: &[RawEvent]) -> Result<usize, sqlx::Error> {
         if events.is_empty() {
             return Ok(0);
         }
 
+        let mut tx = self.db.begin().await?;
         let mut inserted = 0;
+
         for event in events {
             let result = sqlx::query(
                 r#"
@@ -69,7 +71,7 @@ impl EventIndexer {
             .bind(&event.topics)
             .bind(&event.data)
             .bind(Utc::now())
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await?;
 
             if result.rows_affected() > 0 {
@@ -78,8 +80,58 @@ impl EventIndexer {
             }
         }
 
-        info!(inserted, "Event ingestion complete");
+        tx.commit().await?;
+        info!(inserted, "Event batch insertion complete");
         Ok(inserted)
+    }
+
+    /// Ingest a batch of raw events from the Stellar network.
+    #[instrument(skip(self, events), fields(count = events.len()))]
+    pub async fn ingest(&self, events: Vec<RawEvent>) -> Result<usize, sqlx::Error> {
+        self.insert_batch(&events).await
+    }
+
+    /// Catch-up synchronization of historical contract events streaming through
+    /// a bounded channel and flushing database inserts in fixed-size chunks (e.g. 500 events).
+    /// Prevents unbounded memory buffering and OOM panics when syncing large ledger spans.
+    #[instrument(skip(self, event_rx))]
+    pub async fn sync_historical_events(
+        &self,
+        mut event_rx: tokio::sync::mpsc::Receiver<RawEvent>,
+        chunk_size: usize,
+    ) -> Result<usize, sqlx::Error> {
+        let effective_chunk_size = if chunk_size == 0 {
+            HISTORICAL_SYNC_CHUNK_SIZE
+        } else {
+            chunk_size
+        };
+
+        let mut chunk = Vec::with_capacity(effective_chunk_size);
+        let mut total_inserted = 0;
+
+        while let Some(event) = event_rx.recv().await {
+            chunk.push(event);
+            if chunk.len() >= effective_chunk_size {
+                total_inserted += self.insert_batch(&chunk).await?;
+                chunk.clear();
+            }
+        }
+
+        if !chunk.is_empty() {
+            total_inserted += self.insert_batch(&chunk).await?;
+        }
+
+        info!(total_inserted, "Historical catch-up sync completed");
+        Ok(total_inserted)
+    }
+
+    /// Catch-up synchronization using default bounded chunk size (500 events).
+    #[instrument(skip(self, event_rx))]
+    pub async fn catch_up_historical_events(
+        &self,
+        event_rx: tokio::sync::mpsc::Receiver<RawEvent>,
+    ) -> Result<usize, sqlx::Error> {
+        self.sync_historical_events(event_rx, HISTORICAL_SYNC_CHUNK_SIZE).await
     }
 
     /// Query indexed events with optional filters.
@@ -152,6 +204,19 @@ pub struct RawEvent {
     pub data: serde_json::Value,
 }
 
+pub const HISTORICAL_SYNC_CHUNK_SIZE: usize = 500;
+pub const HISTORICAL_CHANNEL_BOUND: usize = 500;
+
+/// Create a bounded channel for streaming historical events with backpressure.
+pub fn create_historical_event_channel(
+    bound: usize,
+) -> (
+    tokio::sync::mpsc::Sender<RawEvent>,
+    tokio::sync::mpsc::Receiver<RawEvent>,
+) {
+    tokio::sync::mpsc::channel(bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +263,30 @@ mod tests {
         assert_eq!(back.contract_id, "CABC");
         assert_eq!(back.ledger_sequence, 100);
         assert_eq!(back.event_index, 0);
+    }
+
+    #[tokio::test]
+    async fn test_historical_event_channel_backpressure() {
+        let (tx, mut rx) = create_historical_event_channel(2);
+        let ev1 = make_event("C1", 10, "tx1", "transfer");
+        let ev2 = make_event("C2", 11, "tx2", "mint");
+
+        tx.send(ev1).await.unwrap();
+        tx.send(ev2).await.unwrap();
+
+        let received1 = rx.recv().await.unwrap();
+        assert_eq!(received1.contract_id, "C1");
+        let received2 = rx.recv().await.unwrap();
+        assert_eq!(received2.contract_id, "C2");
+    }
+
+    #[tokio::test]
+    async fn test_sync_historical_events_empty_channel() {
+        let indexer = EventIndexer::new(lazy_pool());
+        let (tx, rx) = create_historical_event_channel(HISTORICAL_CHANNEL_BOUND);
+        drop(tx);
+
+        let result = indexer.catch_up_historical_events(rx).await.unwrap();
+        assert_eq!(result, 0);
     }
 }
