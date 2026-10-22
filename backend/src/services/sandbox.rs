@@ -83,6 +83,7 @@ pub enum ExecutionStatus {
     Reverted,
     Rejected,
     TimedOut,
+    FuelExhausted,
 }
 
 /// Contract execution response.
@@ -101,7 +102,7 @@ pub struct ContractExecutionResponse {
 }
 
 /// Errors produced before or during sandbox execution.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum SandboxError {
     #[error("invalid sandbox request: {0}")]
     InvalidRequest(String),
@@ -109,6 +110,8 @@ pub enum SandboxError {
     Rejected(String),
     #[error("contract execution timed out after {0} ms")]
     TimedOut(u64),
+    #[error("contract execution exceeded cpu instruction limit: {0}")]
+    FuelExhausted(u64),
     #[error("sandbox worker failed: {0}")]
     Worker(String),
 }
@@ -214,6 +217,20 @@ impl ContractSandboxService {
                         result_xdr_base64: None,
                         diagnostics: vec![format!("execution exceeded {timeout} ms timeout")],
                         cpu_instructions: 0,
+                        memory_bytes: 0,
+                        elapsed_ms: started.elapsed().as_millis(),
+                    });
+                }
+                Err(SandboxError::FuelExhausted(limit)) => {
+                    return Ok(ContractExecutionResponse {
+                        execution_id: Uuid::new_v4(),
+                        status: ExecutionStatus::FuelExhausted,
+                        contract_id: None,
+                        function,
+                        wasm_sha256,
+                        result_xdr_base64: None,
+                        diagnostics: vec![format!("execution exceeded {limit} CPU instruction fuel limit")],
+                        cpu_instructions: limit,
                         memory_bytes: 0,
                         elapsed_ms: started.elapsed().as_millis(),
                     });
@@ -353,6 +370,13 @@ impl ContractExecutor for SorobanContractExecutor {
         let contract_id = env.register_contract_wasm(None, wasm);
         let symbol = Symbol::new(&env, &execution.function);
 
+        // Configure Soroban host environment metering with strict fuel bounds
+        // prior to invoking contract entrypoints.
+        budget.reset_limits(
+            execution.limits.max_cpu_instructions,
+            execution.limits.max_memory_bytes,
+        );
+
         let invocation = catch_unwind(AssertUnwindSafe(|| {
             env.invoke_contract::<Val>(&contract_id, &symbol, args)
         }));
@@ -363,6 +387,9 @@ impl ContractExecutor for SorobanContractExecutor {
 
         match invocation {
             Ok(value) => {
+                if cpu_instructions >= execution.limits.max_cpu_instructions {
+                    return Err(SandboxError::FuelExhausted(execution.limits.max_cpu_instructions));
+                }
                 let xdr_bytes = value.to_xdr(&env);
                 let mut vec = vec![0u8; xdr_bytes.len() as usize];
                 xdr_bytes.copy_into_slice(&mut vec);
@@ -374,15 +401,28 @@ impl ContractExecutor for SorobanContractExecutor {
                     cpu_instructions,
                     memory_bytes,
                 })
-            },
-            Err(panic) => Ok(RawExecution {
-                status: ExecutionStatus::Reverted,
-                contract_id,
-                result_xdr: None,
-                diagnostics: vec![panic_message(panic)],
-                cpu_instructions,
-                memory_bytes,
-            }),
+            }
+            Err(panic) => {
+                let msg = panic_message(panic);
+                let msg_lower = msg.to_lowercase();
+                if cpu_instructions >= execution.limits.max_cpu_instructions
+                    || msg_lower.contains("budget")
+                    || msg_lower.contains("exceededlimit")
+                    || msg_lower.contains("fuel")
+                    || msg_lower.contains("cpu instruction")
+                    || msg_lower.contains("instruction limit")
+                {
+                    return Err(SandboxError::FuelExhausted(execution.limits.max_cpu_instructions));
+                }
+                Ok(RawExecution {
+                    status: ExecutionStatus::Reverted,
+                    contract_id,
+                    result_xdr: None,
+                    diagnostics: vec![msg],
+                    cpu_instructions,
+                    memory_bytes,
+                })
+            }
         }
     }
 }
@@ -864,5 +904,33 @@ mod tests {
         let error = service.execute(req).await.unwrap_err();
 
         assert!(matches!(error, SandboxError::InvalidRequest(_)));
+    }
+
+    struct FuelExhaustedExecutor;
+
+    impl ContractExecutor for FuelExhaustedExecutor {
+        fn execute(&self, execution: PreparedExecution) -> Result<RawExecution, SandboxError> {
+            Err(SandboxError::FuelExhausted(execution.limits.max_cpu_instructions))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_returns_fuel_exhausted_status_when_fuel_limit_exceeded() {
+        let service = ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(FuelExhaustedExecutor),
+        );
+
+        let response = service.execute(request()).await.unwrap();
+
+        assert_eq!(response.status, ExecutionStatus::FuelExhausted);
+        assert_eq!(
+            response.cpu_instructions,
+            SandboxLimits::default().max_cpu_instructions
+        );
+        assert!(response
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("CPU instruction fuel limit")));
     }
 }
