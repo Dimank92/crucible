@@ -5,6 +5,7 @@ use crate::{
     },
 };
 use axum::{extract::State, routing::post, Router};
+use soroban_sdk::xdr::{Limits, ReadXdr, ScVal};
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -60,7 +61,7 @@ pub async fn execute_contract(
         ));
     }
     
-    // Validate args size if present
+    // Validate args size and recursion depth if present
     if !request.args_xdr_base64.is_empty() {
         let args_size: usize = request.args_xdr_base64.iter().map(|s| s.len()).sum();
         const MAX_ARGS_SIZE: usize = 1 * 1024 * 1024; // 1MB
@@ -72,6 +73,21 @@ pub async fn execute_contract(
                     MAX_ARGS_SIZE, args_size
                 ),
             ));
+        }
+
+        // Validate recursion depth for XDR argument structures to prevent stack exhaustion (Issue #1140)
+        const MAX_XDR_DEPTH: u32 = 64;
+        for (i, arg_b64) in request.args_xdr_base64.iter().enumerate() {
+            let limits = Limits {
+                depth: MAX_XDR_DEPTH,
+                len: MAX_ARGS_SIZE,
+            };
+            if let Err(e) = ScVal::from_xdr_base64(arg_b64, limits) {
+                return Err(ApiError::Validation(format!(
+                    "Argument {} exceeds maximum XDR recursion depth of {} or is malformed: {}",
+                    i, MAX_XDR_DEPTH, e
+                )));
+            }
         }
     }
     
@@ -155,6 +171,104 @@ mod tests {
         let payload = json!({
             "wasm_base64": "",
             "function": "hello"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_accepts_valid_xdr_arguments() {
+        use soroban_sdk::xdr::WriteXdr;
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(OkExecutor),
+        ));
+        let app = routes(service);
+        let arg_val = ScVal::U32(42);
+        let arg_b64 = arg_val.to_xdr_base64(Limits::none()).unwrap();
+
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": [arg_b64]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_rejects_excessively_nested_xdr_arguments() {
+        use soroban_sdk::xdr::{ScVec, WriteXdr};
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(OkExecutor),
+        ));
+        let app = routes(service);
+
+        // Build deeply nested ScVal (nested 70 levels deep, exceeding limit of 64)
+        let mut nested = ScVal::U32(1);
+        for _ in 0..70 {
+            nested = ScVal::Vec(Some(ScVec(vec![nested].try_into().unwrap())));
+        }
+        let deeply_nested_b64 = nested.to_xdr_base64(Limits::none()).unwrap();
+
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": [deeply_nested_b64]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_rejects_malformed_xdr_arguments() {
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(OkExecutor),
+        ));
+        let app = routes(service);
+
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": ["not_valid_xdr_base64!"]
         });
 
         let response = app
