@@ -34,6 +34,30 @@ pub struct SandboxLimits {
     pub max_cpu_instructions: u64,
     pub max_memory_bytes: u64,
     pub timeout_ms: u64,
+    #[serde(default = "default_min_ledger_sequence")]
+    pub min_ledger_sequence: u32,
+    #[serde(default = "default_max_ledger_sequence")]
+    pub max_ledger_sequence: u32,
+    #[serde(default = "default_min_ledger_timestamp")]
+    pub min_ledger_timestamp: u64,
+    #[serde(default = "default_max_ledger_timestamp")]
+    pub max_ledger_timestamp: u64,
+}
+
+fn default_min_ledger_sequence() -> u32 {
+    1
+}
+
+fn default_max_ledger_sequence() -> u32 {
+    1_000_000_000
+}
+
+fn default_min_ledger_timestamp() -> u64 {
+    1_000_000_000
+}
+
+fn default_max_ledger_timestamp() -> u64 {
+    4_102_444_800
 }
 
 impl Default for SandboxLimits {
@@ -45,7 +69,28 @@ impl Default for SandboxLimits {
             max_cpu_instructions: 25_000_000,
             max_memory_bytes: 64 * 1024 * 1024,
             timeout_ms: 2_000,
+            min_ledger_sequence: default_min_ledger_sequence(),
+            max_ledger_sequence: default_max_ledger_sequence(),
+            min_ledger_timestamp: default_min_ledger_timestamp(),
+            max_ledger_timestamp: default_max_ledger_timestamp(),
         }
+    }
+}
+
+impl SandboxLimits {
+    /// Configure explicit bounds for simulated ledger sequence and timestamp.
+    pub fn with_ledger_bounds(
+        mut self,
+        min_seq: u32,
+        max_seq: u32,
+        min_ts: u64,
+        max_ts: u64,
+    ) -> Self {
+        self.min_ledger_sequence = min_seq;
+        self.max_ledger_sequence = max_seq;
+        self.min_ledger_timestamp = min_ts;
+        self.max_ledger_timestamp = max_ts;
+        self
     }
 }
 
@@ -281,6 +326,24 @@ impl ContractSandboxService {
                 )));
             }
             args_xdr.push(arg);
+        }
+
+        if let Some(seq) = request.ledger_sequence {
+            if seq < self.limits.min_ledger_sequence || seq > self.limits.max_ledger_sequence {
+                return Err(SandboxError::InvalidRequest(format!(
+                    "ledger_sequence {} is out of valid bounds [{}..{}]",
+                    seq, self.limits.min_ledger_sequence, self.limits.max_ledger_sequence
+                )));
+            }
+        }
+
+        if let Some(ts) = request.ledger_timestamp {
+            if ts < self.limits.min_ledger_timestamp || ts > self.limits.max_ledger_timestamp {
+                return Err(SandboxError::InvalidRequest(format!(
+                    "ledger_timestamp {} is out of valid bounds [{}..{}]",
+                    ts, self.limits.min_ledger_timestamp, self.limits.max_ledger_timestamp
+                )));
+            }
         }
 
         let limits = self.effective_limits(request.budget)?;
@@ -722,7 +785,19 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_validates_ledger_state_input() {
-        let service = ContractSandboxService::default();
+        let service = ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(StaticExecutor {
+                raw: RawExecution {
+                    status: ExecutionStatus::Succeeded,
+                    contract_id: None,
+                    result_xdr: None,
+                    diagnostics: Vec::new(),
+                    cpu_instructions: 1,
+                    memory_bytes: 1,
+                },
+            }),
+        );
         let mut req = request();
         req.ledger_sequence = Some(42);
         req.ledger_timestamp = Some(1_700_000_000);
@@ -864,5 +939,57 @@ mod tests {
         let error = service.execute(req).await.unwrap_err();
 
         assert!(matches!(error, SandboxError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_out_of_bounds_ledger_sequence() {
+        let service = ContractSandboxService::default();
+        
+        // Zero is invalid (genesis is 1)
+        let mut req_zero = request();
+        req_zero.ledger_sequence = Some(0);
+        let err_zero = service.execute(req_zero).await.unwrap_err();
+        assert!(matches!(err_zero, SandboxError::InvalidRequest(_)));
+        assert!(err_zero.to_string().contains("ledger_sequence 0 is out of valid bounds"));
+
+        // Exceeding max is invalid
+        let mut req_high = request();
+        req_high.ledger_sequence = Some(2_000_000_000);
+        let err_high = service.execute(req_high).await.unwrap_err();
+        assert!(matches!(err_high, SandboxError::InvalidRequest(_)));
+        assert!(err_high.to_string().contains("ledger_sequence 2000000000 is out of valid bounds"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_out_of_bounds_ledger_timestamp() {
+        let service = ContractSandboxService::default();
+
+        // Far past before genesis
+        let mut req_low = request();
+        req_low.ledger_timestamp = Some(500);
+        let err_low = service.execute(req_low).await.unwrap_err();
+        assert!(matches!(err_low, SandboxError::InvalidRequest(_)));
+        assert!(err_low.to_string().contains("ledger_timestamp 500 is out of valid bounds"));
+
+        // Far future
+        let mut req_future = request();
+        req_future.ledger_timestamp = Some(5_000_000_000);
+        let err_future = service.execute(req_future).await.unwrap_err();
+        assert!(matches!(err_future, SandboxError::InvalidRequest(_)));
+        assert!(err_future.to_string().contains("ledger_timestamp 5000000000 is out of valid bounds"));
+    }
+
+    #[tokio::test]
+    async fn execute_respects_custom_ledger_bounds() {
+        let limits = SandboxLimits::default().with_ledger_bounds(100, 200, 1_500_000_000, 1_600_000_000);
+        let service = ContractSandboxService::new(limits);
+
+        // Sequence 42 should now fail under custom bounds [100..200]
+        let mut req = request();
+        req.ledger_sequence = Some(42);
+        req.ledger_timestamp = Some(1_550_000_000);
+        let err = service.execute(req).await.unwrap_err();
+        assert!(matches!(err, SandboxError::InvalidRequest(_)));
+        assert!(err.to_string().contains("ledger_sequence 42 is out of valid bounds [100..200]"));
     }
 }
