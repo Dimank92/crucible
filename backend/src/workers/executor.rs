@@ -1,12 +1,39 @@
 use crate::error::AppError;
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
+use futures_util::FutureExt;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tracing::Instrument;
+
+/// Extract string message from a panic payload.
+pub fn extract_panic_message(err: &(dyn Any + Send + 'static)) -> String {
+    if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "Unknown panic payload".to_string()
+    }
+}
+
+/// Handle a Tokio JoinError, extracting the panic message if the task panicked.
+pub fn handle_join_error(err: JoinError) -> AppError {
+    if err.is_panic() {
+        let panic_payload = err.into_panic();
+        let msg = extract_panic_message(&*panic_payload);
+        tracing::error!(panic = %msg, "Background task failed due to panic");
+        AppError::InternalError(format!("Task panicked: {}", msg))
+    } else {
+        tracing::error!(error = %err, "Background task failed to join");
+        AppError::InternalError(format!("Task failed to join: {}", err))
+    }
+}
 
 /// A concurrent task executor that limits the number of concurrently executing tasks.
 ///
@@ -130,8 +157,21 @@ impl TaskExecutor {
                 // Acquire semaphore permit (waits if necessary)
                 let permit = semaphore.acquire_owned().await;
 
+                // Catch task panics to preserve diagnostic traces and prevent worker crashes
+                let task_with_catch = AssertUnwindSafe(task).catch_unwind();
+
                 // Execute the task
-                let result = task.await;
+                let result = match task_with_catch.await {
+                    Ok(task_res) => task_res,
+                    Err(panic_payload) => {
+                        let msg = extract_panic_message(&*panic_payload);
+                        tracing::error!(
+                            panic_message = %msg,
+                            "Background task panicked during execution"
+                        );
+                        Err(AppError::InternalError(format!("Task panicked: {}", msg)))
+                    }
+                };
 
                 // Release the permit implicitly when it goes out of scope
                 drop(permit);
@@ -293,5 +333,71 @@ mod tests {
         assert_eq!(executor.running_count(), 0);
         assert_eq!(executor.completed_count(), 3);
         assert_eq!(executor.failed_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_executor_catches_panics_with_diagnostic_trace() {
+        let executor = TaskExecutor::new(2);
+
+        // Execute task that panics with &str
+        let handle_str = executor.execute(Box::pin(async {
+            panic!("critical database invariant failed");
+            #[allow(unreachable_code)]
+            Ok(())
+        }));
+
+        let res_str = handle_str.await.unwrap();
+        assert!(res_str.is_err(), "Panicking task must return error");
+        let err_msg = format!("{}", res_str.unwrap_err());
+        assert!(err_msg.contains("critical database invariant failed"), "Panic payload must be preserved: {}", err_msg);
+        assert_eq!(executor.failed_count(), 1);
+        assert_eq!(executor.running_count(), 0);
+
+        // Execute task that panics with String
+        let handle_string = executor.execute(Box::pin(async {
+            panic!("{}", format!("out of memory at item {}", 100));
+            #[allow(unreachable_code)]
+            Ok(())
+        }));
+
+        let res_string = handle_string.await.unwrap();
+        assert!(res_string.is_err());
+        let err_msg2 = format!("{}", res_string.unwrap_err());
+        assert!(err_msg2.contains("out of memory at item 100"), "Formatted panic payload must be preserved: {}", err_msg2);
+        assert_eq!(executor.failed_count(), 2);
+        assert_eq!(executor.running_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_executor_permits_released_after_panic() {
+        let executor = TaskExecutor::new(1);
+
+        let panic_handle = executor.execute(Box::pin(async {
+            panic!("worker thread failed");
+            #[allow(unreachable_code)]
+            Ok(())
+        }));
+        let _ = panic_handle.await.unwrap();
+
+        // Concurrency slot must be immediately freed and available
+        let success_handle = executor.execute(Box::pin(async {
+            Ok(())
+        }));
+        let res = success_handle.await.unwrap();
+        assert!(res.is_ok(), "Subsequent task must succeed without slot leak");
+        assert_eq!(executor.completed_count(), 1);
+        assert_eq!(executor.failed_count(), 1);
+        assert_eq!(executor.running_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_join_error_extracts_panic_payload() {
+        let raw_handle: JoinHandle<()> = tokio::spawn(async {
+            panic!("fatal worker panic");
+        });
+        let join_err = raw_handle.await.unwrap_err();
+        let app_err = handle_join_error(join_err);
+        let err_str = format!("{}", app_err);
+        assert!(err_str.contains("fatal worker panic"));
     }
 }
