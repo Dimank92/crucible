@@ -84,6 +84,7 @@ validator = { version = "0.19", features = ["derive"] }
 async-trait = "0.1"
 subtle = "2.6"
 url = { version = "2", features = ["serde"] }
+wasmparser = "0.116"
 
 # API documentation
 utoipa = { version = "5.5", features = ["axum_extras", "chrono", "uuid", "decimal"] }
