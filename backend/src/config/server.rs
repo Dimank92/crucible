@@ -26,6 +26,9 @@ pub struct ServerConfig {
     /// Maximum request body size for sandbox execution in bytes (default: 5MB)
     #[serde(default = "default_sandbox_max_size")]
     pub sandbox_max_size: usize,
+    /// Grace period in seconds to wait for background workers and in-flight jobs to drain before terminating (default: 30s)
+    #[serde(default = "default_worker_grace_period_secs")]
+    pub worker_grace_period_secs: u64,
     /// TLS configuration (required in production, optional elsewhere)
     pub tls: Option<TlsConfig>,
 }
@@ -42,6 +45,10 @@ fn default_sandbox_max_size() -> usize {
     5 * 1024 * 1024 // 5MB
 }
 
+fn default_worker_grace_period_secs() -> u64 {
+    30
+}
+
 impl fmt::Debug for ServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerConfig")
@@ -52,6 +59,7 @@ impl fmt::Debug for ServerConfig {
             .field("max_body_size", &self.max_body_size)
             .field("compile_max_size", &self.compile_max_size)
             .field("sandbox_max_size", &self.sandbox_max_size)
+            .field("worker_grace_period_secs", &self.worker_grace_period_secs)
             .field("tls", &self.tls)
             .finish()
     }
@@ -73,5 +81,40 @@ impl fmt::Debug for TlsConfig {
             .field("cert_path", &self.cert_path)
             .field("key_path", &"[REDACTED]")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_config_defaults_include_worker_grace_period() {
+        let json_str = r#"{
+            "host": "127.0.0.1",
+            "port": 8080,
+            "request_timeout_ms": 30000,
+            "max_connections": 1000
+        }"#;
+
+        let config: ServerConfig = serde_json::from_str(json_str).unwrap();
+        assert_eq!(config.worker_grace_period_secs, 30);
+        assert_eq!(config.max_body_size, 10 * 1024 * 1024);
+        assert_eq!(config.compile_max_size, 1 * 1024 * 1024);
+        assert_eq!(config.sandbox_max_size, 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn server_config_custom_worker_grace_period() {
+        let json_str = r#"{
+            "host": "0.0.0.0",
+            "port": 9000,
+            "request_timeout_ms": 15000,
+            "max_connections": 500,
+            "worker_grace_period_secs": 45
+        }"#;
+
+        let config: ServerConfig = serde_json::from_str(json_str).unwrap();
+        assert_eq!(config.worker_grace_period_secs, 45);
     }
 }
