@@ -188,13 +188,33 @@ impl AdminAuthState {
     }
 
     /// Returns true when `jti` is present in the Redis revocation blocklist.
-    async fn is_jti_revoked(&self, jti: &str) -> bool {
+    pub async fn is_jti_revoked(&self, jti: &str) -> bool {
+        self.is_token_or_user_revoked(jti, None).await
+    }
+
+    /// Returns true when `jti` or the user subject identifier is present in the Redis revocation blocklist.
+    pub async fn is_token_or_user_revoked(&self, jti: &str, sub: Option<&str>) -> bool {
         let Some(redis) = &self.redis else {
             return false;
         };
-        let key = format!("{TOKEN_BLOCKLIST_PREFIX}{jti}");
         match redis.get_multiplexed_async_connection().await {
-            Ok(mut conn) => conn.exists::<_, bool>(key).await.unwrap_or(false),
+            Ok(mut conn) => {
+                let jti_key = format!("{TOKEN_BLOCKLIST_PREFIX}{jti}");
+                if conn.exists::<_, bool>(jti_key).await.unwrap_or(false) {
+                    return true;
+                }
+                if let Some(user_id) = sub {
+                    let user_key = format!("{TOKEN_BLOCKLIST_PREFIX}user:{user_id}");
+                    if conn.exists::<_, bool>(user_key).await.unwrap_or(false) {
+                        return true;
+                    }
+                    let blocklist_key = format!("user_blocklist:{user_id}");
+                    if conn.exists::<_, bool>(blocklist_key).await.unwrap_or(false) {
+                        return true;
+                    }
+                }
+                false
+            }
             Err(err) => {
                 // Fail closed when Redis is configured but unreachable: a
                 // revoked token must not slip through during an outage.
@@ -317,12 +337,12 @@ pub async fn require_admin_auth(
     if let Some(secret) = auth.jwt_secret.as_deref() {
         if let Some(claims) = verify_hs256_jwt(&token, secret) {
             if let Some(jti) = claims.jti.as_deref() {
-                if auth.is_jti_revoked(jti).await {
-                    warn!(jti, "Privileged request rejected: JWT jti is revoked");
+                if auth.is_token_or_user_revoked(jti, claims.sub.as_deref()).await {
+                    warn!(jti, sub = ?claims.sub, "Privileged request rejected: JWT jti or user session is revoked");
                     return reject(
                         StatusCode::UNAUTHORIZED,
                         "unauthorized",
-                        "Token has been revoked",
+                        "Token or session has been revoked",
                     );
                 }
             } else {
