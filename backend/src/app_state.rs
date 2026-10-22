@@ -75,6 +75,8 @@ pub fn build_application_states(
     let websocket = Arc::new(WsState {
         metrics_exporter: services.metrics_exporter.clone(),
         error_manager: services.error_manager.clone(),
+        outbound_buffer_limit: crate::api::handlers::ws::DEFAULT_MAX_OUTBOUND_BUFFER,
+        send_timeout: crate::api::handlers::ws::DEFAULT_SEND_TIMEOUT,
     });
 
     let audit = Arc::new(AuditService::new(db_pool, Arc::new(redis_client)));
