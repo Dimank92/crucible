@@ -203,6 +203,7 @@ fn test_sensitive_fields_redacted_in_debug() {
             pool_size: 10,
             connection_timeout_ms: 1000,
             max_retries: 3,
+            startup_timeout_ms: 30000,
         },
         observability: crate::config::ObservabilityConfig {
             log_level: "info".into(),
