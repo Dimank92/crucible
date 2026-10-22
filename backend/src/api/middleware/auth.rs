@@ -51,6 +51,7 @@ pub struct Principal {
     pub id: i32,
     pub address: String,
     pub role: Role,
+    pub organization_id: Option<i32>,
 }
 
 impl Principal {
@@ -60,7 +61,14 @@ impl Principal {
             id,
             address: address.into(),
             role: Role::Admin,
+            organization_id: None,
         }
+    }
+
+    /// Attach an organization / tenant ID to this principal.
+    pub fn with_org(mut self, org_id: i32) -> Self {
+        self.organization_id = Some(org_id);
+        self
     }
 
     fn to_auth_user(&self) -> AuthUser {
@@ -68,6 +76,8 @@ impl Principal {
             id: self.id,
             address: self.address.clone(),
             role: self.role,
+            organization_id: self.organization_id,
+            permissions: Some(self.role.default_permissions()),
         }
     }
 }
@@ -85,6 +95,9 @@ struct JwtClaims {
     /// Optional role claim (`admin`, `user`, …).
     #[serde(default)]
     role: Option<String>,
+    /// Optional organization / tenant ID claim.
+    #[serde(default)]
+    org_id: Option<i32>,
 }
 
 /// Registry mapping bearer tokens to the principals they authenticate, plus
@@ -156,6 +169,7 @@ impl AdminAuthState {
                         id: 2,
                         address: "operator".to_string(),
                         role: Role::User,
+                        organization_id: None,
                     },
                 );
             }
@@ -284,6 +298,7 @@ fn principal_from_jwt_claims(claims: &JwtClaims) -> Principal {
         id,
         address,
         role: role_from_claim(claims.role.as_deref()),
+        organization_id: claims.org_id,
     }
 }
 
