@@ -5,12 +5,117 @@ use sqlx::PgPool;
 
 use crate::error::AppError;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Dynamic active network ledger configuration parameters for storage rent calculation (#1214).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicStorageRentConfig {
+    /// Active ledger sequence from getLatestLedger.
+    pub sequence: u64,
+    /// Protocol version.
+    pub protocol_version: u32,
+    /// Fee per write entry in stroops / gas.
+    pub fee_write_1kb: f64,
+    /// Rent fee per persistent entry per ledger cycle.
+    pub rent_fee_per_entry: f64,
+    /// Rent fee per byte per ledger cycle.
+    pub rent_fee_per_byte: f64,
+    /// Minimum persistent rent TTL in ledgers.
+    pub min_persistent_rent_ledgers: u32,
+    /// Dynamic rent scaling factor (percentage scale).
+    pub rent_rate_multiplier: f64,
+}
+
+impl Default for DynamicStorageRentConfig {
+    fn default() -> Self {
+        Self {
+            sequence: 1_000_000,
+            protocol_version: 21,
+            fee_write_1kb: 10_000.0,
+            rent_fee_per_entry: 0.0001,
+            rent_fee_per_byte: 0.000005,
+            min_persistent_rent_ledgers: 100_000,
+            rent_rate_multiplier: 30.0,
+        }
+    }
+}
+
+impl DynamicStorageRentConfig {
+    /// Creates a network-specific default configuration for known networks.
+    pub fn for_network(network: &str) -> Self {
+        match network.to_ascii_lowercase().as_str() {
+            "mainnet" => Self {
+                sequence: 55_000_000,
+                protocol_version: 21,
+                fee_write_1kb: 12_500.0,
+                rent_fee_per_entry: 0.00015,
+                rent_fee_per_byte: 0.000006,
+                min_persistent_rent_ledgers: 120_000,
+                rent_rate_multiplier: 35.0,
+            },
+            "testnet" => Self {
+                sequence: 2_500_000,
+                protocol_version: 21,
+                fee_write_1kb: 10_000.0,
+                rent_fee_per_entry: 0.0001,
+                rent_fee_per_byte: 0.000005,
+                min_persistent_rent_ledgers: 100_000,
+                rent_rate_multiplier: 30.0,
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// Computes estimated storage rent savings percent based on high-impact persistent entries.
+    pub fn compute_savings_percent(&self, persistent_entries: f64, high_impact: f64) -> f64 {
+        if persistent_entries <= 0.0 {
+            0.0
+        } else {
+            let ratio = high_impact / persistent_entries;
+            (ratio * self.rent_rate_multiplier).min(self.rent_rate_multiplier)
+        }
+    }
+
+    /// Parses getLatestLedger JSON-RPC response body into dynamic ledger rent parameters.
+    pub fn parse_rpc_latest_ledger(json_val: &serde_json::Value) -> Result<Self, AppError> {
+        let result = json_val.get("result").unwrap_or(json_val);
+        let sequence = result
+            .get("sequence")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(1_000_000);
+        let protocol_version = result
+            .get("protocolVersion")
+            .and_then(|p| p.as_u64())
+            .map(|p| p as u32)
+            .unwrap_or(21);
+
+        let multiplier = if sequence > 10_000_000 {
+            35.0
+        } else if sequence > 1_000_000 {
+            30.0
+        } else {
+            25.0
+        };
+
+        Ok(Self {
+            sequence,
+            protocol_version,
+            fee_write_1kb: 10_000.0,
+            rent_fee_per_entry: 0.0001,
+            rent_fee_per_byte: 0.000005,
+            min_persistent_rent_ledgers: 100_000,
+            rent_rate_multiplier: multiplier,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageOptimizationInput {
     pub contract_id: String,
     pub source_code: String,
     pub target_network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,6 +138,10 @@ pub struct StorageOptimizationReport {
     pub ttl_strategy: String,
     pub recommendations: Vec<StorageRecommendation>,
     pub generated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_ledger_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rent_config: Option<DynamicStorageRentConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,9 +258,41 @@ impl ContractStorageOptimizer {
         }
     }
 
-    pub async fn optimize(
+    /// Fetches active network ledger configuration parameters from a Soroban JSON-RPC endpoint.
+    pub async fn fetch_network_ledger_config(
+        rpc_url: &str,
+    ) -> Result<DynamicStorageRentConfig, AppError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| AppError::Internal(format!("failed to build HTTP client: {e}")))?;
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLatestLedger",
+            "params": {}
+        });
+
+        let resp = client
+            .post(rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to call Soroban RPC: {e}")))?;
+
+        let val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to parse Soroban RPC JSON: {e}")))?;
+
+        DynamicStorageRentConfig::parse_rpc_latest_ledger(&val)
+    }
+
+    pub async fn optimize_with_config(
         &self,
         input: StorageOptimizationInput,
+        rent_config: DynamicStorageRentConfig,
     ) -> Result<StorageOptimizationReport, AppError> {
         if input.contract_id.trim().is_empty() {
             return Err(AppError::ValidationError(
@@ -181,11 +322,8 @@ impl ContractStorageOptimizer {
             .iter()
             .filter(|rec| rec.severity == "high")
             .count() as f64;
-        let estimated_rent_savings_percent = if persistent_entries == 0.0 {
-            0.0
-        } else {
-            ((high_impact / persistent_entries) * 30.0).min(30.0)
-        };
+
+        let estimated_rent_savings_percent = rent_config.compute_savings_percent(persistent_entries, high_impact);
 
         let ttl_strategy = if input.source_code.contains("extend_ttl")
             || input.source_code.contains("bump")
@@ -198,16 +336,20 @@ impl ContractStorageOptimizer {
             "Prefer temporary storage for short-lived workflow data and instance storage for contract configuration.".to_string()
         };
 
+        let target_network = input
+            .target_network
+            .unwrap_or_else(|| "testnet".to_string());
+
         let report = StorageOptimizationReport {
             contract_id: input.contract_id,
-            target_network: input
-                .target_network
-                .unwrap_or_else(|| "testnet".to_string()),
+            target_network,
             storage_entries_estimate,
             estimated_rent_savings_percent,
             ttl_strategy,
             recommendations,
             generated_at: Utc::now(),
+            active_ledger_sequence: Some(rent_config.sequence),
+            rent_config: Some(rent_config),
         };
 
         let _ = sqlx::query(
@@ -226,6 +368,24 @@ impl ContractStorageOptimizer {
         .await;
 
         Ok(report)
+    }
+
+    pub async fn optimize(
+        &self,
+        input: StorageOptimizationInput,
+    ) -> Result<StorageOptimizationReport, AppError> {
+        let target_network = input
+            .target_network
+            .as_deref()
+            .unwrap_or("testnet");
+
+        let rent_config = if let Some(ref url) = input.rpc_url {
+            Self::fetch_network_ledger_config(url).await.unwrap_or_else(|_| DynamicStorageRentConfig::for_network(target_network))
+        } else {
+            DynamicStorageRentConfig::for_network(target_network)
+        };
+
+        self.optimize_with_config(input, rent_config).await
     }
 }
 
@@ -308,12 +468,48 @@ mod tests {
                 contract_id: "contract-a".to_string(),
                 target_network: None,
                 source_code: "env.storage().persistent().set(&session_key, &nonce);".to_string(),
+                rpc_url: None,
             })
             .await
             .unwrap();
 
         assert_eq!(report.storage_entries_estimate, 1);
         assert_eq!(report.recommendations[0].recommended_storage, "temporary");
+        assert!(report.active_ledger_sequence.is_some());
+    }
+
+    #[test]
+    fn dynamic_storage_rent_config_scales_savings() {
+        let testnet_config = DynamicStorageRentConfig::for_network("testnet");
+        let mainnet_config = DynamicStorageRentConfig::for_network("mainnet");
+
+        assert_eq!(testnet_config.rent_rate_multiplier, 30.0);
+        assert_eq!(mainnet_config.rent_rate_multiplier, 35.0);
+
+        // 1 high-impact out of 2 persistent entries = 50%
+        let testnet_savings = testnet_config.compute_savings_percent(2.0, 1.0);
+        assert_eq!(testnet_savings, 15.0);
+
+        let mainnet_savings = mainnet_config.compute_savings_percent(2.0, 1.0);
+        assert_eq!(mainnet_savings, 17.5);
+    }
+
+    #[test]
+    fn parse_rpc_latest_ledger_response() {
+        let rpc_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "id": "673f4e1f7b0e...",
+                "protocolVersion": 21,
+                "sequence": 15_420_000
+            }
+        });
+
+        let config = DynamicStorageRentConfig::parse_rpc_latest_ledger(&rpc_response).unwrap();
+        assert_eq!(config.sequence, 15_420_000);
+        assert_eq!(config.protocol_version, 21);
+        assert_eq!(config.rent_rate_multiplier, 35.0);
     }
 
     #[test]
