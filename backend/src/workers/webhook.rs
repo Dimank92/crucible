@@ -148,14 +148,37 @@ impl WebhookDispatcherWorker {
                 let host = url
                     .host_str()
                     .ok_or_else(|| anyhow::anyhow!("webhook URL has no host"))?;
+
+                let pinned_addr = addresses[0];
+                let port = pinned_addr.port();
+                let host_header = match url.port() {
+                    Some(p) => format!("{}:{}", host, p),
+                    None => host.to_string(),
+                };
+                let mut request_headers = headers.clone();
+                request_headers.insert("Host".to_string(), host_header);
+
+                let target_url = if url.scheme() == "http" {
+                    let mut direct_url = url.clone();
+                    direct_url
+                        .set_ip_host(pinned_addr.ip())
+                        .map_err(|_| anyhow::anyhow!("failed to set pinned IP in webhook URL"))?;
+                    direct_url
+                        .set_port(Some(port))
+                        .map_err(|_| anyhow::anyhow!("failed to set pinned port in webhook URL"))?;
+                    direct_url
+                } else {
+                    url.clone()
+                };
+
                 let client = reqwest::Client::builder()
                     .connect_timeout(WEBHOOK_TIMEOUT)
                     .timeout(WEBHOOK_TIMEOUT)
                     .redirect(reqwest::redirect::Policy::none())
-                    .resolve_to_addrs(host, &addresses)
+                    .resolve_to_addrs(host, std::slice::from_ref(&pinned_addr))
                     .build()?;
 
-                send_webhook_request(&client, &url, &headers, &serialized_body)
+                send_webhook_request(&client, &target_url, &request_headers, &serialized_body)
                     .await
                     .map_err(anyhow::Error::from)
             })
@@ -451,5 +474,70 @@ mod tests {
         let log = worker.retry_webhook_delivery(&endpoint, &event).await;
         assert!(!log.success);
         assert_eq!(log.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn test_dns_rebinding_pins_direct_ip_and_sets_host_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let event = WebhookEvent {
+            id: Uuid::new_v4(),
+            event_type: "contract_deployed".to_string(),
+            payload: serde_json::json!({ "contract_id": "0xabc" }),
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        let serialized_body = serde_json::to_string(&event).unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/webhook"))
+            .and(header("Host", "webhook.example.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers.insert("Host".to_string(), "webhook.example.com".to_string());
+
+        let url = Url::parse(&format!("{}/webhook", server.uri())).unwrap();
+        let (status, success, response_body) =
+            send_webhook_request(&client, &url, &headers, &serialized_body)
+                .await
+                .unwrap();
+
+        assert_eq!(status, 200);
+        assert!(success);
+        assert_eq!(response_body.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_event_rejects_internal_cloud_metadata() {
+        let worker = WebhookDispatcherWorker::default();
+        let endpoint = WebhookEndpoint {
+            id: Uuid::new_v4(),
+            url: "http://169.254.169.254/latest/meta-data".to_string(),
+            secret: "secret".to_string(),
+            event_types: vec!["contract_deployed".to_string()],
+            enabled: true,
+        };
+        let event = WebhookEvent {
+            id: Uuid::new_v4(),
+            event_type: "contract_deployed".to_string(),
+            payload: serde_json::json!({ "contract_id": "0xabc" }),
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+
+        let log = worker.dispatch_event(&endpoint, &event, 1).await;
+        assert!(!log.success);
+        assert_eq!(log.status_code, None);
+        assert_eq!(log.endpoint_id, endpoint.id);
+        assert_eq!(log.event_id, event.id);
     }
 }
