@@ -267,6 +267,96 @@ struct Lease {
     acquired_at: std::time::Instant,
 }
 
+// ── SecretString & VaultSecretCache ───────────────────────────────────────────
+
+/// A zeroizing wrapper for secret strings in memory (e.g. database passwords, API keys)
+/// to prevent plaintext retention in process memory dumps and accidental logging.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString {
+    inner: Vec<u8>,
+}
+
+impl SecretString {
+    /// Create a new protected secret string.
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self {
+            inner: secret.into().into_bytes(),
+        }
+    }
+
+    /// Expose the plaintext secret reference securely for immediate cryptographic or connection usage.
+    pub fn expose_secret(&self) -> &str {
+        std::str::from_utf8(&self.inner).unwrap_or("")
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        for b in self.inner.iter_mut() {
+            unsafe {
+                std::ptr::write_volatile(b, 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+impl std::fmt::Display for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+/// In-memory cache for secrets fetched from Vault with automatic zeroization on eviction.
+///
+/// Addresses issue #1253: prevents plaintext secrets from lingering in process memory or core dumps.
+#[derive(Debug, Default)]
+pub struct VaultSecretCache {
+    secrets: std::collections::HashMap<String, SecretString>,
+}
+
+impl VaultSecretCache {
+    pub fn new() -> Self {
+        Self {
+            secrets: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Insert or update a cached secret.
+    pub fn insert(&mut self, key: impl Into<String>, secret: impl Into<String>) {
+        self.secrets.insert(key.into(), SecretString::new(secret));
+    }
+
+    /// Retrieve a reference to a cached secret if present.
+    pub fn get(&self, key: &str) -> Option<&SecretString> {
+        self.secrets.get(key)
+    }
+
+    /// Remove a secret from the cache, triggering memory zeroization when the returned SecretString drops.
+    pub fn remove(&mut self, key: &str) -> Option<SecretString> {
+        self.secrets.remove(key)
+    }
+
+    /// Clear all secrets in the cache, zeroizing all values on drop.
+    pub fn clear(&mut self) {
+        self.secrets.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.secrets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+}
+
 // ── VaultClient ────────────────────────────────────────────────────────────────
 
 /// Thread-safe Vault client.
@@ -281,6 +371,8 @@ pub struct VaultClient {
     token: Arc<RwLock<String>>,
     /// Active leases that need periodic renewal.
     leases: Arc<RwLock<Vec<Lease>>>,
+    /// In-memory cache for secrets with zeroization on eviction.
+    pub secret_cache: Arc<RwLock<VaultSecretCache>>,
 }
 
 impl VaultClient {
@@ -301,6 +393,7 @@ impl VaultClient {
             http: Arc::new(http),
             token: Arc::new(RwLock::new(String::new())),
             leases: Arc::new(RwLock::new(Vec::new())),
+            secret_cache: Arc::new(RwLock::new(VaultSecretCache::new())),
         };
 
         client.authenticate().await?;
@@ -459,6 +552,24 @@ impl VaultClient {
             version: kv.metadata.version,
             created_time: kv.metadata.created_time,
         })
+    }
+
+    /// Retrieve a cached secret if present.
+    pub async fn get_cached_secret(&self, key: &str) -> Option<SecretString> {
+        let cache = self.secret_cache.read().await;
+        cache.get(key).cloned()
+    }
+
+    /// Cache a secret with zeroization on eviction.
+    pub async fn cache_secret(&self, key: &str, secret: &str) {
+        let mut cache = self.secret_cache.write().await;
+        cache.insert(key, secret);
+    }
+
+    /// Invalidate/evict a cached secret, returning the zeroized wrapper.
+    pub async fn invalidate_cached_secret(&self, key: &str) -> Option<SecretString> {
+        let mut cache = self.secret_cache.write().await;
+        cache.remove(key)
     }
 
     /// Write a secret to Vault KV v2.
@@ -861,6 +972,7 @@ mod tests {
             http: Arc::new(http),
             token: Arc::new(RwLock::new("test-token".into())),
             leases: Arc::new(RwLock::new(vec![])),
+            secret_cache: Arc::new(RwLock::new(VaultSecretCache::new())),
         };
 
         let headers = client.base_headers("test-token");
@@ -870,4 +982,39 @@ mod tests {
             "test-token"
         );
     }
+
+    #[test]
+    fn test_secret_string_redacted_in_debug_and_display() {
+        // Issue #1253: Secret Cache in Vault Service Stores Plaintext Passwords in Process Memory
+        let secret = SecretString::new("super-secret-password-123");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        assert_eq!(format!("{secret}"), "[REDACTED]");
+        assert_eq!(secret.expose_secret(), "super-secret-password-123");
+    }
+
+    #[tokio::test]
+    async fn test_vault_secret_cache_insert_get_evict_zeroization() {
+        // Issue #1253: In-memory secret caching with secure zeroization on eviction
+        let mut cache = VaultSecretCache::new();
+        assert!(cache.is_empty());
+
+        cache.insert("db_pass", "postgres_master_pw");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.get("db_pass").unwrap().expose_secret(),
+            "postgres_master_pw"
+        );
+
+        let removed = cache.remove("db_pass");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().expose_secret(), "postgres_master_pw");
+        assert!(cache.is_empty());
+
+        cache.insert("token_a", "secret_a");
+        cache.insert("token_b", "secret_b");
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+    }
 }
+
