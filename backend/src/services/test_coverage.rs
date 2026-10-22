@@ -48,6 +48,8 @@ impl From<CoverageError> for AppError {
 #[serde(rename_all = "camelCase")]
 pub struct TestCoverage {
     pub id: Uuid,
+    #[sqlx(default)]
+    pub contract_id: Option<String>,
     pub project_name: String,
     pub branch: String,
     pub commit_sha: String,
@@ -62,6 +64,8 @@ pub struct TestCoverage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NewTestCoverage {
+    #[serde(default)]
+    pub contract_id: Option<String>,
     pub project_name: String,
     pub branch: String,
     pub commit_sha: String,
@@ -93,13 +97,21 @@ impl TestCoverageService {
 
         info!("Persisting coverage report");
 
+        let contract_id = data
+            .contract_id
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&data.project_name);
+
         let record = sqlx::query_as::<_, TestCoverage>(
             "INSERT INTO test_coverage \
-             (id, project_name, branch, commit_sha, coverage_percent, total_lines, covered_lines, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             (id, contract_id, project_name, branch, commit_sha, coverage_percent, total_lines, covered_lines, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              RETURNING *",
         )
         .bind(Uuid::new_v4())
+        .bind(contract_id)
         .bind(&data.project_name)
         .bind(&data.branch)
         .bind(&data.commit_sha)
@@ -130,7 +142,7 @@ impl TestCoverageService {
         debug!("Coverage cache miss – querying database");
         let record = sqlx::query_as::<_, TestCoverage>(
             "SELECT * FROM test_coverage \
-             WHERE project_name = $1 \
+             WHERE project_name = $1 OR contract_id = $1 \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(project_name)
@@ -140,6 +152,29 @@ impl TestCoverageService {
 
         self.cache_set(project_name, &record).await?;
         Ok(record)
+    }
+
+    /// Return the historical coverage progression for a contract or project.
+    ///
+    /// Utilizes the composite index on (contract_id, created_at DESC) and (project_name, created_at DESC).
+    #[instrument(skip(self), fields(contract_id = %contract_id, limit = %limit))]
+    pub async fn get_coverage_progression(
+        &self,
+        contract_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TestCoverage>, CoverageError> {
+        let max_limit = limit.clamp(1, 100);
+        let records = sqlx::query_as::<_, TestCoverage>(
+            "SELECT * FROM test_coverage \
+             WHERE contract_id = $1 OR project_name = $1 \
+             ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(contract_id)
+        .bind(max_limit)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(records)
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -217,6 +252,7 @@ mod tests {
 
     fn valid_coverage() -> NewTestCoverage {
         NewTestCoverage {
+            contract_id: Some("contract-123".to_string()),
             project_name: "my-contract".to_string(),
             branch: "main".to_string(),
             commit_sha: "abc123".to_string(),
@@ -224,6 +260,17 @@ mod tests {
             total_lines: 200,
             covered_lines: 175,
         }
+    }
+
+    #[test]
+    fn new_test_coverage_deserializes_with_optional_contract_id() {
+        let json = r#"{"projectName":"my-proj","branch":"main","commitSha":"123","coveragePercent":90.0,"totalLines":10,"coveredLines":9}"#;
+        let parsed: NewTestCoverage = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.contract_id, None);
+
+        let json_with_contract = r#"{"contractId":"c-456","projectName":"my-proj","branch":"main","commitSha":"123","coveragePercent":90.0,"totalLines":10,"coveredLines":9}"#;
+        let parsed_with_contract: NewTestCoverage = serde_json::from_str(json_with_contract).unwrap();
+        assert_eq!(parsed_with_contract.contract_id.as_deref(), Some("c-456"));
     }
 
     // ── validate_coverage ─────────────────────────────────────────────────────

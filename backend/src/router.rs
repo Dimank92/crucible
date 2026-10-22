@@ -230,6 +230,8 @@ pub fn build_router(
             "/api/v1/coverage",
             Router::new()
                 .route("/", post(coverage::submit_coverage))
+                .route("/:contract_id/history", get(coverage::get_coverage_progression))
+                .route("/progression/:contract_id", get(coverage::get_coverage_progression))
                 .route("/:project", get(coverage::get_latest_coverage))
                 .with_state(coverage_state),
         )
