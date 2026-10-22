@@ -74,17 +74,17 @@ impl Principal {
 
 /// Claims extracted from a verified HS256 JWT access token.
 #[derive(Debug, Clone, Deserialize)]
-struct JwtClaims {
+pub(crate) struct JwtClaims {
     /// JWT ID — used for Redis revocation lookups.
-    jti: Option<String>,
+    pub(crate) jti: Option<String>,
     /// Expiration as seconds since the Unix epoch.
-    exp: Option<i64>,
+    pub(crate) exp: Option<i64>,
     /// Optional subject / user id.
     #[serde(default)]
-    sub: Option<String>,
+    pub(crate) sub: Option<String>,
     /// Optional role claim (`admin`, `user`, …).
     #[serde(default)]
-    role: Option<String>,
+    pub(crate) role: Option<String>,
 }
 
 /// Registry mapping bearer tokens to the principals they authenticate, plus
@@ -203,6 +203,26 @@ impl AdminAuthState {
             }
         }
     }
+
+    /// Check whether a token is valid (either as a registered static token or valid JWT).
+    pub async fn is_token_valid(&self, token: &str) -> bool {
+        if self.tokens.contains_key(token) {
+            return true;
+        }
+
+        if let Some(secret) = self.jwt_secret.as_deref() {
+            if let Some(claims) = verify_hs256_jwt(token, secret) {
+                if let Some(jti) = claims.jti.as_deref() {
+                    if self.is_jti_revoked(jti).await {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 /// Extract the bearer token from the `Authorization` header, if well-formed.
@@ -228,7 +248,7 @@ fn b64url_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// Verify an HS256 JWT and return its claims, or `None` on any failure.
-fn verify_hs256_jwt(token: &str, secret: &str) -> Option<JwtClaims> {
+pub(crate) fn verify_hs256_jwt(token: &str, secret: &str) -> Option<JwtClaims> {
     let mut parts = token.split('.');
     let header = parts.next()?;
     let payload = parts.next()?;
@@ -242,7 +262,7 @@ fn verify_hs256_jwt(token: &str, secret: &str) -> Option<JwtClaims> {
     mac.update(signing_input.as_bytes());
     let expected = mac.finalize().into_bytes();
     let actual = b64url_decode(signature)?;
-    if expected.as_ref() != actual.as_slice() {
+    if expected.as_slice() != actual.as_slice() {
         return None;
     }
 
