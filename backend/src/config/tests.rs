@@ -183,6 +183,7 @@ fn test_sensitive_fields_redacted_in_debug() {
             max_body_size: 10 * 1024 * 1024,
             compile_max_size: 1024 * 1024,
             sandbox_max_size: 5 * 1024 * 1024,
+            http2_max_concurrent_streams: 100,
             tls: Some(crate::config::server::TlsConfig {
                 cert_path: "/path/to/cert".into(),
                 key_path: "/path/to/secret.key".into(),
@@ -203,6 +204,7 @@ fn test_sensitive_fields_redacted_in_debug() {
             pool_size: 10,
             connection_timeout_ms: 1000,
             max_retries: 3,
+            startup_timeout_ms: 30000,
         },
         observability: crate::config::ObservabilityConfig {
             log_level: "info".into(),
