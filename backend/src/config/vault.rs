@@ -677,6 +677,102 @@ impl VaultClient {
         Ok(resp.auth.map(|a| a.lease_duration).unwrap_or(3600))
     }
 
+    /// Attempt to renew the client token with exponential backoff on network errors.
+    ///
+    /// Retries up to `max_renewal_attempts` before attempting full re-authentication.
+    /// Does not terminate the renewal loop on transient network errors.
+    pub async fn renew_token_with_backoff(&self) -> Result<u64, VaultError> {
+        let max_attempts = self.config.max_renewal_attempts.max(1);
+        let mut base_delay = Duration::from_secs(1);
+        let max_delay = Duration::from_secs(30);
+
+        for attempt in 1..=max_attempts {
+            match self.renew_token().await {
+                Ok(ttl) => {
+                    info!(
+                        attempt = attempt,
+                        ttl_secs = ttl,
+                        "VaultClient: token successfully renewed"
+                    );
+                    return Ok(ttl);
+                }
+                Err(err) => {
+                    warn!(
+                        attempt = attempt,
+                        max_attempts = max_attempts,
+                        error = %err,
+                        "VaultClient: transient error during token renewal"
+                    );
+
+                    // Check if token is already revoked or expired (HTTP 400 or 403)
+                    if let VaultError::Http { status, .. } = &err {
+                        if *status == 400 || *status == 403 {
+                            warn!("VaultClient: token is revoked or expired; attempting immediate re-authentication");
+                            self.authenticate().await?;
+                            return Ok(3600);
+                        }
+                    }
+
+                    if attempt < max_attempts {
+                        tokio::time::sleep(base_delay).await;
+                        base_delay = (base_delay * 2).min(max_delay);
+                    }
+                }
+            }
+        }
+
+        warn!(
+            attempts = max_attempts,
+            "VaultClient: token renewal exhausted retries; falling back to re-authentication"
+        );
+        match self.authenticate().await {
+            Ok(()) => {
+                info!("VaultClient: successfully re-authenticated after token renewal exhaustion");
+                Ok(3600)
+            }
+            Err(e) => {
+                error!(error = %e, "VaultClient: re-authentication failed after token renewal exhaustion");
+                Err(VaultError::RenewalExhausted { attempts: max_attempts })
+            }
+        }
+    }
+
+    /// Spawn a resilient background task that continuously renews the Vault client token.
+    ///
+    /// The renewal loop uses exponential backoff and automatic re-authentication so
+    /// network errors do not terminate the loop permanently.
+    pub fn start_token_renewal(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let client = Arc::clone(&self);
+        tokio::spawn(async move {
+            info!("VaultClient: starting resilient token renewal loop");
+            let mut interval_duration = Duration::from_secs(1800); // 30 minutes default for 1hr token
+
+            loop {
+                tokio::time::sleep(interval_duration).await;
+                match client.renew_token_with_backoff().await {
+                    Ok(duration_secs) => {
+                        let half_ttl = Duration::from_secs(duration_secs / 2);
+                        let margin_bound = Duration::from_secs(duration_secs).saturating_sub(client.config.renewal_margin);
+                        interval_duration = half_ttl.min(margin_bound).max(Duration::from_secs(10));
+                        debug!(
+                            next_renewal_in_secs = interval_duration.as_secs(),
+                            "VaultClient: scheduled next token renewal"
+                        );
+                    }
+                    Err(e) => {
+                        // Even if both renewal and re-auth fail (e.g. prolonged network partition),
+                        // DO NOT terminate the loop permanently! Wait backoff duration and retry again.
+                        error!(
+                            error = %e,
+                            "VaultClient: token renewal and re-auth cycle failed; retrying in 30 seconds"
+                        );
+                        interval_duration = Duration::from_secs(30);
+                    }
+                }
+            }
+        })
+    }
+
     // ── HTTP helpers ──────────────────────────────────────────────────────────
 
     fn base_headers(&self, token: &str) -> HeaderMap {
@@ -797,6 +893,7 @@ pub async fn init_vault() -> Result<Arc<VaultClient>, VaultError> {
     let config = VaultConfig::from_env()?;
     let client = Arc::new(VaultClient::new(config).await?);
     client.clone().start_lease_renewal().await;
+    client.clone().start_token_renewal();
     Ok(client)
 }
 
@@ -869,5 +966,26 @@ mod tests {
             headers["x-vault-token"].to_str().unwrap(),
             "test-token"
         );
+    }
+
+    #[tokio::test]
+    async fn token_renewal_loop_spawns_and_handles_transient_failures() {
+        let config = dev_config();
+        let http = HttpClient::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let client = Arc::new(VaultClient {
+            config: Arc::new(config),
+            http: Arc::new(http),
+            token: Arc::new(RwLock::new("test-token".into())),
+            leases: Arc::new(RwLock::new(vec![])),
+        });
+
+        let handle = client.start_token_renewal();
+        // Give background loop time to launch
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!handle.is_finished(), "Token renewal task must stay alive");
+        handle.abort();
     }
 }
