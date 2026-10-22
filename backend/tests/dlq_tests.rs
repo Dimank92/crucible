@@ -12,6 +12,7 @@ fn test_dead_letter_job_serialization() {
         attempts: 5,
         first_failed_at: now,
         failed_at: now,
+        replay_count: 0,
     };
 
     let json_str = serde_json::to_string(&job).expect("Should serialize DeadLetterJob");
@@ -20,5 +21,6 @@ fn test_dead_letter_job_serialization() {
 
     assert_eq!(deserialized.id, "job-999");
     assert_eq!(deserialized.attempts, 5);
+    assert_eq!(deserialized.replay_count, 0);
     assert_eq!(deserialized.job_name, "CONTRACT_VERIFY");
 }
