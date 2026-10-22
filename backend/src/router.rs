@@ -23,7 +23,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::{
     api::handlers::{
         admin, alerts, contracts as contract_handlers, coverage, dashboard,
-        dashboard::get_dashboard, errors, profiling, sandbox, stellar, ws::ws_dashboard_handler,
+        dashboard::get_dashboard, deploy_health, errors, profiling, sandbox, stellar, ws::ws_dashboard_handler,
     },
     api::middleware::{
         content_type::require_json_content_type,
@@ -92,6 +92,10 @@ pub fn build_router(
     } = states;
 
     let dlq_coordinator = Arc::new(crate::workers::retry::DlqCoordinator::new(Arc::new(redis_client.clone())));
+    let deploy_health_state = Arc::new(deploy_health::DeployHealthState::new(
+        db_pool.clone(),
+        redis_client.clone(),
+    ));
 
     let contracts_router = Router::new()
         .route("/compile", post(contract_handlers::compile_contract))
@@ -232,6 +236,21 @@ pub fn build_router(
                 .route("/", post(coverage::submit_coverage))
                 .route("/:project", get(coverage::get_latest_coverage))
                 .with_state(coverage_state),
+        )
+        .nest(
+            "/api/v1/health",
+            Router::new()
+                .route("/deploy", get(deploy_health::get_deploy_health))
+                .with_state(deploy_health_state.clone()),
+        )
+        .nest(
+            "/api/v1/deployments",
+            Router::new()
+                .route("/", post(deploy_health::create_deployment))
+                .route("/:id", get(deploy_health::get_deployment))
+                .route("/contract/:contract_id", get(deploy_health::list_deployments_for_contract))
+                .route("/:id/status", axum::routing::patch(deploy_health::update_deployment_status))
+                .with_state(deploy_health_state),
         )
         .route(
             "/api/v1/ws/dashboard",
