@@ -4,6 +4,27 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+/// Sanitizes extracted docstring comments against HTML injection and Stored XSS.
+pub fn sanitize_docstring(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    for c in trimmed.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamDoc {
     pub name: String,
@@ -71,9 +92,10 @@ impl DocGeneratorService {
                     .unwrap_or("")
                     .to_string();
                 if !fn_name.is_empty() {
+                    let clean_doc = sanitize_docstring(&pending_doc);
                     functions.push(FunctionDoc {
                         name: fn_name,
-                        description: pending_doc.trim().to_string(),
+                        description: clean_doc,
                         params: vec![],
                         returns: "unknown".to_string(),
                         visibility: if trimmed.starts_with("pub") {
@@ -86,23 +108,25 @@ impl DocGeneratorService {
                 pending_doc.clear();
             } else if trimmed.contains("events().publish") {
                 let event_name = trimmed
-                    .split('(')
+                    .split("publish(")
                     .nth(1)
+                    .or_else(|| trimmed.split('(').nth(2))
                     .and_then(|s| s.split(',').next())
                     .unwrap_or("unknown")
                     .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
                     .to_string();
                 if !event_name.is_empty() {
+                    let clean_doc = sanitize_docstring(&pending_doc);
                     events.push(EventDoc {
                         name: event_name,
-                        description: pending_doc.trim().to_string(),
+                        description: clean_doc,
                         fields: vec![],
                     });
                 }
                 pending_doc.clear();
             } else if !trimmed.is_empty() {
                 if description.is_empty() && !pending_doc.is_empty() {
-                    description = pending_doc.trim().to_string();
+                    description = sanitize_docstring(&pending_doc);
                 }
                 pending_doc.clear();
             }
@@ -143,5 +167,85 @@ impl DocGeneratorService {
 
     pub fn generate_json(&self, doc: &ContractDoc) -> serde_json::Value {
         serde_json::to_value(doc).unwrap_or(serde_json::Value::Null)
+    }
+
+    pub fn generate_openapi_spec(&self, doc: &ContractDoc) -> serde_json::Value {
+        let mut paths = serde_json::Map::new();
+
+        for f in &doc.functions {
+            let mut operation = serde_json::Map::new();
+            operation.insert("summary".to_string(), serde_json::json!(f.name));
+            operation.insert("description".to_string(), serde_json::json!(f.description));
+            operation.insert(
+                "responses".to_string(),
+                serde_json::json!({
+                    "200": { "description": "Successful execution" }
+                }),
+            );
+
+            let mut method_map = serde_json::Map::new();
+            method_map.insert("post".to_string(), serde_json::Value::Object(operation));
+            paths.insert(format!("/{}", f.name), serde_json::Value::Object(method_map));
+        }
+
+        serde_json::json!({
+            "openapi": "3.0.0",
+            "info": {
+                "title": doc.contract_name,
+                "version": doc.version,
+                "description": doc.description
+            },
+            "paths": paths
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_xss_payload_in_docstrings_sanitized() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        let service = DocGeneratorService::new(pool);
+        let malicious_source = r#"
+/// Contract top-level description <script>alert("XSS")</script>
+pub struct Contract;
+
+/// Transfers tokens safely <img src=x onerror=alert(1)>
+pub fn transfer(to: String, amount: u64) {}
+
+/// Emits when tokens transferred <iframe src="javascript:alert('owned')">
+events().publish((transfer, to, amount));
+"#;
+
+        let doc = service.generate("TokenContract", malicious_source).await.unwrap();
+
+        // Check contract description
+        assert!(!doc.description.contains("<script>"));
+        assert!(doc.description.contains("&lt;script&gt;alert(&quot;XSS&quot;)&lt;/script&gt;"));
+
+        // Check function description
+        let transfer_fn = doc.functions.iter().find(|f| f.name == "transfer").unwrap();
+        assert!(!transfer_fn.description.contains("<img"));
+        assert!(transfer_fn.description.contains("&lt;img src=x onerror=alert(1)&gt;"));
+
+        // Check event description
+        let transfer_event = doc.events.iter().find(|e| e.name == "transfer").unwrap();
+        assert!(!transfer_event.description.contains("<iframe"));
+        assert!(transfer_event.description.contains("&lt;iframe src=&quot;javascript:alert(&#x27;owned&#x27;)&quot;&gt;"));
+
+        // Check Markdown output
+        let md = service.generate_markdown(&doc);
+        assert!(!md.contains("<script>"));
+        assert!(!md.contains("<img"));
+        assert!(!md.contains("<iframe"));
+
+        // Check OpenAPI spec output
+        let openapi = service.generate_openapi_spec(&doc);
+        let openapi_str = openapi.to_string();
+        assert!(!openapi_str.contains("<script>"));
+        assert!(!openapi_str.contains("<img"));
+        assert!(!openapi_str.contains("<iframe"));
     }
 }
