@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{error, info, info_span, instrument, warn};
+use tracing::{info, info_span, instrument, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FundAccountRequest {
@@ -46,6 +46,7 @@ pub struct FaucetDispenserService {
     account_rate_limits: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
     max_requests_per_window: usize,
     rate_window: Duration,
+    redis: Option<redis::Client>,
 }
 
 impl Default for FaucetDispenserService {
@@ -64,13 +65,77 @@ impl FaucetDispenserService {
             account_rate_limits: Arc::new(Mutex::new(HashMap::new())),
             max_requests_per_window: 5,
             rate_window: Duration::from_secs(60),
+            redis: None,
         }
     }
 
-    pub async fn check_rate_limit(&self, ip: &str, destination: &str) -> bool {
+    /// Attach a Redis client to enable centralized sliding-window rate limiting across multi-pod deployments.
+    pub fn with_redis(mut self, redis: redis::Client) -> Self {
+        self.redis = Some(redis);
+        self
+    }
+
+    /// Check rate limit against centralized Redis using a sliding-window sorted set.
+    async fn check_redis_rate_limit(
+        &self,
+        redis: &redis::Client,
+        key: &str,
+    ) -> Result<bool, redis::RedisError> {
+        let mut conn = redis.get_multiplexed_async_connection().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let window_millis = self.rate_window.as_millis() as i64;
+        let clear_before = now - window_millis;
+        let expire_secs = (self.rate_window.as_secs() + 10).max(60) as i64;
+        let member = format!("{}:{}", now, uuid::Uuid::new_v4());
+
+        // 1. Prune expired timestamps older than sliding window
+        // 2. Count requests currently within sliding window
+        let (_removed, count): (i64, usize) = redis::pipe()
+            .atomic()
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(key)
+            .arg("-inf")
+            .arg(clear_before)
+            .cmd("ZCARD")
+            .arg(key)
+            .query_async(&mut conn)
+            .await?;
+
+        if count >= self.max_requests_per_window {
+            return Ok(false);
+        }
+
+        // Add this request timestamp and set TTL
+        let _: () = redis::pipe()
+            .atomic()
+            .cmd("ZADD")
+            .arg(key)
+            .arg(now)
+            .arg(&member)
+            .cmd("EXPIRE")
+            .arg(key)
+            .arg(expire_secs)
+            .query_async(&mut conn)
+            .await?;
+
+        Ok(true)
+    }
+
+    /// Check rate limit against local in-memory stores.
+    async fn check_in_memory_rate_limit(&self, ip: &str, destination: &str) -> bool {
         let mut limits = self.rate_limits.lock().await;
         let mut account_limits = self.account_rate_limits.lock().await;
         let now = Instant::now();
+
+        // Prune expired entries and purge empty keys to prevent unbounded memory growth
+        limits.retain(|_, timestamps| {
+            timestamps.retain(|&t| now.duration_since(t) < self.rate_window);
+            !timestamps.is_empty()
+        });
+        account_limits.retain(|_, timestamps| {
+            timestamps.retain(|&t| now.duration_since(t) < self.rate_window);
+            !timestamps.is_empty()
+        });
 
         // Prune and check IP rate limit
         let ip_timestamps = limits.entry(ip.to_string()).or_default();
@@ -89,6 +154,30 @@ impl FaucetDispenserService {
         ip_timestamps.push(now);
         acc_timestamps.push(now);
         true
+    }
+
+    /// Check rate limit for IP and destination account using centralized Redis when available,
+    /// falling back cleanly to in-memory tracking.
+    pub async fn check_rate_limit(&self, ip: &str, destination: &str) -> bool {
+        if let Some(redis) = &self.redis {
+            let ip_key = format!("faucet:ratelimit:ip:{ip}");
+            let dest_key = format!("faucet:ratelimit:dest:{destination}");
+
+            match self.check_redis_rate_limit(redis, &ip_key).await {
+                Ok(false) => return false,
+                Ok(true) => match self.check_redis_rate_limit(redis, &dest_key).await {
+                    Ok(dest_ok) => return dest_ok,
+                    Err(e) => {
+                        warn!(error = %e, "Redis faucet rate limiter failed on destination, falling back to local store");
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, "Redis faucet rate limiter failed on IP, falling back to local store");
+                }
+            }
+        }
+
+        self.check_in_memory_rate_limit(ip, destination).await
     }
 
     pub async fn replenish_pool(&self, amount: Decimal) {
@@ -219,9 +308,24 @@ pub async fn dispense_faucet_handler(
 
 static GLOBAL_FAUCET_POOL: std::sync::OnceLock<Arc<FaucetDispenserService>> = std::sync::OnceLock::new();
 
+/// Initialize the global faucet pool with a centralized Redis client.
+pub fn init_faucet_pool_with_redis(redis: redis::Client) {
+    let _ = GLOBAL_FAUCET_POOL.set(Arc::new(FaucetDispenserService::new().with_redis(redis)));
+}
+
 pub fn get_faucet_pool() -> Arc<FaucetDispenserService> {
     GLOBAL_FAUCET_POOL
-        .get_or_init(|| Arc::new(FaucetDispenserService::new()))
+        .get_or_init(|| {
+            let mut svc = FaucetDispenserService::new();
+            if let Ok(url) = std::env::var("REDIS_URL") {
+                if !url.trim().is_empty() {
+                    if let Ok(client) = redis::Client::open(url) {
+                        svc = svc.with_redis(client);
+                    }
+                }
+            }
+            Arc::new(svc)
+        })
         .clone()
 }
 
@@ -350,5 +454,30 @@ mod tests {
         service.replenish_pool(Decimal::new(5000, 0)).await;
         let after_stats = service.get_stats().await;
         assert_eq!(after_stats.balance_xlm, initial_stats.balance_xlm + Decimal::new(5000, 0));
+    }
+
+    #[tokio::test]
+    async fn test_faucet_service_with_redis_builder() {
+        let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        let service = FaucetDispenserService::new().with_redis(client);
+        assert!(service.redis.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_faucet_rate_limit_pruning_removes_expired_entries() {
+        let mut service = FaucetDispenserService::new();
+        service.rate_window = Duration::from_millis(50);
+        let dest = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
+
+        assert!(service.check_rate_limit("1.2.3.4", dest).await);
+        let stats_before = service.get_stats().await;
+        assert_eq!(stats_before.rate_limited_ips_count, 1);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Next check prunes expired entry, preventing monotonic memory growth
+        assert!(service.check_rate_limit("5.6.7.8", dest).await);
+        let stats_after = service.get_stats().await;
+        assert_eq!(stats_after.rate_limited_ips_count, 1);
     }
 }
