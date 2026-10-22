@@ -60,3 +60,35 @@ impl JobHandler for CleanupJob {
         Ok(())
     }
 }
+
+/// A scheduled job that executes hourly and daily pre-aggregated activity rollups (#1222).
+pub struct AnalyticsRollupJob;
+
+#[async_trait]
+impl JobHandler for AnalyticsRollupJob {
+    #[instrument(skip_all, fields(job_name = ctx.job_name))]
+    async fn run(&self, ctx: JobContext) -> Result<(), JobError> {
+        info!("Running contract analytics historical rollup job");
+        let aggregator = crate::services::analytics_aggregator::AnalyticsAggregator::new(ctx.pool, ctx.redis);
+        let now = chrono::Utc::now();
+        let one_day_ago = now - chrono::Duration::hours(24);
+
+        let hourly_rows = aggregator
+            .aggregate_hourly_rollups(one_day_ago, now)
+            .await
+            .map_err(JobError::DatabaseError)?;
+
+        let yesterday = (now - chrono::Duration::days(1)).date_naive();
+        let daily_rows = aggregator
+            .aggregate_daily_rollups(yesterday)
+            .await
+            .map_err(JobError::DatabaseError)?;
+
+        info!(
+            hourly_rows_updated = hourly_rows,
+            daily_rows_updated = daily_rows,
+            "Contract analytics rollups completed successfully"
+        );
+        Ok(())
+    }
+}

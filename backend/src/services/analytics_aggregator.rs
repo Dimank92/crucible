@@ -4,7 +4,7 @@
 //! unique callers) from indexed events and build metrics, storing roll-ups
 //! in PostgreSQL and caching summaries in Redis.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -48,6 +48,32 @@ pub struct AnomalyAlert {
     pub z_score: f64,
     pub severity: String,
     pub timestamp: DateTime<Utc>,
+}
+
+/// Pre-aggregated hourly activity rollup for a smart contract (#1222).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContractHourlyRollup {
+    pub contract_id: String,
+    pub bucket_hour: DateTime<Utc>,
+    pub call_count: i64,
+    pub error_count: i64,
+    pub total_gas_used: f64,
+    pub unique_callers: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Pre-aggregated daily activity rollup for a smart contract (#1222).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContractDailyRollup {
+    pub contract_id: String,
+    pub bucket_date: NaiveDate,
+    pub call_count: i64,
+    pub error_count: i64,
+    pub total_gas_used: f64,
+    pub unique_callers: i64,
+    pub created_at: DateTime<Utc>,
 }
 
 pub struct AnalyticsAggregator {
@@ -102,6 +128,98 @@ impl AnalyticsAggregator {
         } else {
             None
         }
+    }
+
+    /// Generates hourly rollup records from raw events for the specified time range (#1222).
+    pub async fn aggregate_hourly_rollups(
+        &self,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            INSERT INTO contract_hourly_rollups
+                (contract_id, bucket_hour, call_count, error_count, total_gas_used, unique_callers, created_at)
+            SELECT
+                contract_id,
+                date_trunc('hour', indexed_at) AS bucket_hour,
+                COUNT(*) AS call_count,
+                COUNT(*) FILTER (WHERE event_type = 'error') AS error_count,
+                COALESCE(SUM((data->>'gas_used')::double precision), 0.0) AS total_gas_used,
+                COUNT(DISTINCT data->>'caller') AS unique_callers,
+                NOW() AS created_at
+            FROM contract_events
+            WHERE indexed_at >= $1 AND indexed_at < $2
+            GROUP BY contract_id, date_trunc('hour', indexed_at)
+            ON CONFLICT (contract_id, bucket_hour) DO UPDATE SET
+                call_count = EXCLUDED.call_count,
+                error_count = EXCLUDED.error_count,
+                total_gas_used = EXCLUDED.total_gas_used,
+                unique_callers = EXCLUDED.unique_callers,
+                created_at = NOW()
+            "#,
+        )
+        .bind(start_time)
+        .bind(end_time)
+        .execute(&self.db)
+        .await?;
+
+        Ok(res.rows_affected())
+    }
+
+    /// Aggregates hourly rollups into a single day's summary rollup (#1222).
+    pub async fn aggregate_daily_rollups(&self, target_date: NaiveDate) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            INSERT INTO contract_daily_rollups
+                (contract_id, bucket_date, call_count, error_count, total_gas_used, unique_callers, created_at)
+            SELECT
+                contract_id,
+                bucket_hour::date AS bucket_date,
+                SUM(call_count) AS call_count,
+                SUM(error_count) AS error_count,
+                SUM(total_gas_used) AS total_gas_used,
+                MAX(unique_callers) AS unique_callers,
+                NOW() AS created_at
+            FROM contract_hourly_rollups
+            WHERE bucket_hour >= $1::timestamp AND bucket_hour < ($1::timestamp + INTERVAL '1 day')
+            GROUP BY contract_id, bucket_hour::date
+            ON CONFLICT (contract_id, bucket_date) DO UPDATE SET
+                call_count = EXCLUDED.call_count,
+                error_count = EXCLUDED.error_count,
+                total_gas_used = EXCLUDED.total_gas_used,
+                unique_callers = EXCLUDED.unique_callers,
+                created_at = NOW()
+            "#,
+        )
+        .bind(target_date)
+        .execute(&self.db)
+        .await?;
+
+        Ok(res.rows_affected())
+    }
+
+    /// Queries historical contract activity from pre-aggregated daily summary tables (#1222).
+    /// Avoids scanning raw event tables across large multi-day windows.
+    pub async fn query_historical_activity(
+        &self,
+        contract_id: &str,
+        days: i64,
+    ) -> Result<Vec<ContractDailyRollup>, sqlx::Error> {
+        let rollups = sqlx::query_as::<_, ContractDailyRollup>(
+            r#"
+            SELECT contract_id, bucket_date, call_count, error_count, total_gas_used, unique_callers, created_at
+            FROM contract_daily_rollups
+            WHERE contract_id = $1 AND bucket_date >= (CURRENT_DATE - ($2 || ' days')::interval)::date
+            ORDER BY bucket_date ASC
+            "#,
+        )
+        .bind(contract_id)
+        .bind(days)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(rollups)
     }
 
     /// Compute and cache analytics for a specific contract.
@@ -361,5 +479,42 @@ mod tests {
         assert_eq!(alert.metric, "gas_usage");
         assert_eq!(alert.severity, "HIGH");
         assert!(alert.z_score > 3.0);
+    }
+
+    #[test]
+    fn test_rollup_serialization() {
+        let now = Utc::now();
+        let hourly = ContractHourlyRollup {
+            contract_id: "CA123".to_string(),
+            bucket_hour: now,
+            call_count: 1500,
+            error_count: 12,
+            total_gas_used: 450000.0,
+            unique_callers: 350,
+            created_at: now,
+        };
+
+        let json = serde_json::to_string(&hourly).unwrap();
+        let deserialized: ContractHourlyRollup = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.contract_id, "CA123");
+        assert_eq!(deserialized.call_count, 1500);
+        assert_eq!(deserialized.error_count, 12);
+        assert_eq!(deserialized.unique_callers, 350);
+
+        let date = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
+        let daily = ContractDailyRollup {
+            contract_id: "CA123".to_string(),
+            bucket_date: date,
+            call_count: 36000,
+            error_count: 280,
+            total_gas_used: 10800000.0,
+            unique_callers: 4200,
+            created_at: now,
+        };
+
+        let json_daily = serde_json::to_string(&daily).unwrap();
+        let deserialized_daily: ContractDailyRollup = serde_json::from_str(&json_daily).unwrap();
+        assert_eq!(deserialized_daily.bucket_date, date);
+        assert_eq!(deserialized_daily.call_count, 36000);
     }
 }
