@@ -89,12 +89,12 @@ pub async fn logging_middleware(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let version = request.version();
-    let metric_route = request
+    let raw_route = request
         .extensions()
         .get::<MatchedPath>()
         .map(MatchedPath::as_str)
-        .unwrap_or("UNMATCHED")
-        .to_string();
+        .unwrap_or_else(|| uri.path());
+    let metric_route = crate::services::http_metrics::normalize_route(raw_route);
 
     let path = sanitize_for_log(uri.path());
     let span = TracingService::http_request_span(method.as_str(), &path, None);
