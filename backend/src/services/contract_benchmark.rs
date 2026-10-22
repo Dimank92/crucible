@@ -132,6 +132,34 @@ pub struct OperationBenchmarkSummary {
     pub avg_resource_fee_stroops: f64,
 }
 
+impl OperationBenchmarkSummary {
+    /// Constructs an explicit zeroed summary for operations with empty samples (#1213).
+    pub fn zeroed(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            sample_count: 0,
+            success_rate: 0.0,
+            min_duration_us: 0,
+            avg_duration_us: 0.0,
+            p95_duration_us: 0,
+            max_duration_us: 0,
+            avg_cpu_instructions: 0.0,
+            total_cpu_instructions: 0,
+            avg_memory_bytes: 0.0,
+            peak_memory_bytes: 0,
+            total_ledger_read_entries: 0,
+            total_ledger_write_entries: 0,
+            total_ledger_read_bytes: 0,
+            total_ledger_write_bytes: 0,
+            total_transaction_size_bytes: 0,
+            total_events_return_bytes: 0,
+            total_ledger_space_rent_stroops: 0,
+            total_resource_fee_stroops: 0,
+            avg_resource_fee_stroops: 0.0,
+        }
+    }
+}
+
 /// Regression detail emitted when a metric exceeds its threshold.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BenchmarkRegression {
@@ -203,6 +231,10 @@ impl OperationAccumulator {
     }
 
     fn into_summary(mut self, operation: String) -> OperationBenchmarkSummary {
+        if self.sample_count == 0 {
+            return OperationBenchmarkSummary::zeroed(operation);
+        }
+
         self.durations.sort_unstable();
         let p95_duration_us = percentile_nearest_rank(&self.durations, 95);
         let sample_count = self.sample_count as f64;
@@ -210,7 +242,7 @@ impl OperationAccumulator {
         OperationBenchmarkSummary {
             operation,
             sample_count: self.sample_count,
-            success_rate: self.success_count as f64 / sample_count,
+            success_rate: (self.success_count as f64 / sample_count).clamp(0.0, 1.0),
             min_duration_us: self.min_duration_us,
             avg_duration_us: self.total_duration_us as f64 / sample_count,
             p95_duration_us,
@@ -458,12 +490,12 @@ fn push_regression(
     current: f64,
     threshold_pct: f64,
 ) {
-    if baseline <= 0.0 {
+    if !baseline.is_finite() || baseline <= 0.0 || !current.is_finite() {
         return;
     }
 
     let change_pct = ((current - baseline) / baseline) * 100.0;
-    if change_pct > threshold_pct {
+    if change_pct.is_finite() && change_pct > threshold_pct {
         regressions.push(BenchmarkRegression {
             metric: metric.to_string(),
             baseline,
@@ -667,5 +699,49 @@ mod tests {
         assert_eq!(reports.len(), HISTORY_LIMIT_PER_CONTRACT);
         assert_eq!(reports[0].benchmark_name, "run_59");
         assert_eq!(reports[49].benchmark_name, "run_10");
+    }
+
+    #[test]
+    fn test_empty_accumulator_produces_zeroed_summary_without_nan() {
+        let acc = OperationAccumulator::default();
+        let summary = acc.into_summary("empty_op".to_string());
+
+        assert_eq!(summary.operation, "empty_op");
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.success_rate, 0.0);
+        assert_eq!(summary.avg_duration_us, 0.0);
+        assert_eq!(summary.avg_cpu_instructions, 0.0);
+        assert_eq!(summary.avg_memory_bytes, 0.0);
+        assert_eq!(summary.avg_resource_fee_stroops, 0.0);
+
+        // Verify that this summary serializes cleanly to JSON without NaN errors
+        let json_str = serde_json::to_string(&summary);
+        assert!(json_str.is_ok());
+        let val: serde_json::Value = serde_json::from_str(&json_str.unwrap()).unwrap();
+        assert_eq!(val["sample_count"], 0);
+        assert_eq!(val["avg_duration_us"], 0.0);
+    }
+
+    #[test]
+    fn test_operation_benchmark_summary_zeroed_helper() {
+        let summary = OperationBenchmarkSummary::zeroed("custom_zero");
+        assert_eq!(summary.operation, "custom_zero");
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.avg_duration_us, 0.0);
+        assert!(summary.avg_duration_us.is_finite());
+        assert!(!summary.avg_duration_us.is_nan());
+    }
+
+    #[test]
+    fn test_push_regression_guards_against_nan_and_zero_baseline() {
+        let mut regressions = Vec::new();
+        push_regression(&mut regressions, "test_metric", 0.0, 100.0, 10.0);
+        assert!(regressions.is_empty());
+
+        push_regression(&mut regressions, "test_metric", f64::NAN, 100.0, 10.0);
+        assert!(regressions.is_empty());
+
+        push_regression(&mut regressions, "test_metric", 100.0, f64::NAN, 10.0);
+        assert!(regressions.is_empty());
     }
 }
