@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 /// Default bounded channel capacity (ledgers waiting to be processed).
 pub const DEFAULT_BUFFER_CAPACITY: usize = 256;
@@ -36,6 +37,10 @@ pub enum IngestionError {
     BackpressureTimeout,
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    #[error("database error: {0}")]
+    Database(String),
+    #[error("transaction error: {0}")]
+    Transaction(String),
 }
 
 /// Pipeline tuning knobs.
@@ -81,19 +86,62 @@ impl IngestionConfig {
     }
 }
 
+/// Contract event record to be ingested alongside the ledger batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractEventRecord {
+    pub id: Uuid,
+    pub contract_id: String,
+    pub ledger_sequence: u64,
+    pub transaction_hash: String,
+    pub event_index: i32,
+    pub event_type: String,
+    pub topics: Vec<String>,
+    pub data: String,
+}
+
+/// Transaction call log record to be ingested alongside the ledger batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransactionLogRecord {
+    pub contract_id: String,
+    pub function_name: String,
+    pub arguments: serde_json::Value,
+    pub caller: Option<String>,
+    pub status: String,
+    pub gas_used: u64,
+}
+
 /// A single ledger batch pulled from Soroban RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LedgerBatch {
     pub sequence: u64,
     pub tx_count: u32,
     pub closed_at: u64,
+    #[serde(default)]
+    pub events: Vec<ContractEventRecord>,
+    #[serde(default)]
+    pub logs: Vec<TransactionLogRecord>,
 }
 
-/// Persists the last successfully processed ledger sequence.
+impl LedgerBatch {
+    pub fn new(sequence: u64, tx_count: u32, closed_at: u64) -> Self {
+        Self {
+            sequence,
+            tx_count,
+            closed_at,
+            events: Vec::new(),
+            logs: Vec::new(),
+        }
+    }
+}
+
+/// Persists the last successfully processed ledger sequence and batch data.
 #[async_trait::async_trait]
 pub trait LedgerCursorStore: Send + Sync {
     async fn load_cursor(&self) -> Result<Option<u64>, IngestionError>;
     async fn save_cursor(&self, sequence: u64) -> Result<(), IngestionError>;
+    async fn save_batch(&self, batch: &LedgerBatch) -> Result<(), IngestionError> {
+        self.save_cursor(batch.sequence).await
+    }
 }
 
 /// In-memory cursor store used by unit / load tests.
@@ -122,9 +170,13 @@ impl LedgerCursorStore for InMemoryCursorStore {
         *self.cursor.lock().expect("lock") = Some(sequence);
         Ok(())
     }
+
+    async fn save_batch(&self, batch: &LedgerBatch) -> Result<(), IngestionError> {
+        self.save_cursor(batch.sequence).await
+    }
 }
 
-/// PostgreSQL-backed cursor store (crash-resilient resumption).
+/// PostgreSQL-backed cursor store (crash-resilient resumption with atomic batch transactions).
 pub struct PostgresCursorStore {
     pool: sqlx::PgPool,
     worker_id: String,
@@ -136,6 +188,86 @@ impl PostgresCursorStore {
             pool,
             worker_id: worker_id.into(),
         }
+    }
+
+    /// Atomically writes contract events, transaction logs, and updates the cursor
+    /// within a single database transaction. If any write or the cursor update fails,
+    /// the entire transaction is rolled back.
+    pub async fn ingest_batch_transactional(
+        &self,
+        batch: &LedgerBatch,
+    ) -> Result<(), IngestionError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| IngestionError::Transaction(e.to_string()))?;
+
+        // 1. Batch contract events write
+        for event in &batch.events {
+            sqlx::query(
+                r#"
+                INSERT INTO contract_events
+                    (id, contract_id, ledger_sequence, transaction_hash, event_index, event_type, topics, data, indexed_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                ON CONFLICT (transaction_hash, event_index) DO NOTHING
+                "#,
+            )
+            .bind(event.id)
+            .bind(&event.contract_id)
+            .bind(event.ledger_sequence as i64)
+            .bind(&event.transaction_hash)
+            .bind(event.event_index)
+            .bind(&event.event_type)
+            .bind(&event.topics)
+            .bind(&event.data)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| IngestionError::Database(e.to_string()))?;
+        }
+
+        // 2. Batch transaction call logs write
+        for log in &batch.logs {
+            sqlx::query(
+                r#"
+                INSERT INTO contract_call_logs
+                    (contract_id, function_name, arguments, caller, status, gas_used, timestamp)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                "#,
+            )
+            .bind(&log.contract_id)
+            .bind(&log.function_name)
+            .bind(&log.arguments)
+            .bind(&log.caller)
+            .bind(&log.status)
+            .bind(log.gas_used as f64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| IngestionError::Database(e.to_string()))?;
+        }
+
+        // 3. Atomically update cursor progression
+        sqlx::query(
+            r#"
+            INSERT INTO ingestion_cursors (worker_id, last_ledger, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (worker_id) DO UPDATE
+            SET last_ledger = EXCLUDED.last_ledger,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&self.worker_id)
+        .bind(batch.sequence as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| IngestionError::CursorStore(e.to_string()))?;
+
+        // 4. Commit atomic transaction
+        tx.commit()
+            .await
+            .map_err(|e| IngestionError::Transaction(e.to_string()))?;
+
+        Ok(())
     }
 }
 
@@ -158,6 +290,12 @@ impl LedgerCursorStore for PostgresCursorStore {
     }
 
     async fn save_cursor(&self, sequence: u64) -> Result<(), IngestionError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| IngestionError::Transaction(e.to_string()))?;
+
         sqlx::query(
             r#"
             INSERT INTO ingestion_cursors (worker_id, last_ledger, updated_at)
@@ -169,10 +307,19 @@ impl LedgerCursorStore for PostgresCursorStore {
         )
         .bind(&self.worker_id)
         .bind(sequence as i64)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| IngestionError::CursorStore(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| IngestionError::Transaction(e.to_string()))?;
+
         Ok(())
+    }
+
+    async fn save_batch(&self, batch: &LedgerBatch) -> Result<(), IngestionError> {
+        self.ingest_batch_transactional(batch).await
     }
 }
 
@@ -344,7 +491,7 @@ impl IngestionPipeline {
 
         let mut processed = 0usize;
         for batch in batches {
-            self.cursor.save_cursor(batch.sequence).await?;
+            self.cursor.save_batch(&batch).await?;
             self.last_sequence
                 .store(batch.sequence, Ordering::SeqCst);
             self.ingested.fetch_add(1, Ordering::SeqCst);
@@ -416,11 +563,11 @@ impl LedgerSource for SyntheticLedgerSource {
         let mut out = Vec::with_capacity(self.batch_size as usize);
         for i in 0..self.batch_size {
             let seq = start + u64::from(i);
-            out.push(LedgerBatch {
-                sequence: seq,
-                tx_count: 1 + (seq % 7) as u32,
-                closed_at: 1_700_000_000 + seq,
-            });
+            out.push(LedgerBatch::new(
+                seq,
+                1 + (seq % 7) as u32,
+                1_700_000_000 + seq,
+            ));
         }
         if let Some(last) = out.last() {
             self.next.store(last.sequence + 1, Ordering::SeqCst);
@@ -583,5 +730,43 @@ mod tests {
             Arc::new(InMemoryCursorStore::new()),
         );
         assert!(matches!(res, Err(IngestionError::InvalidConfig(_))));
+    }
+
+    #[tokio::test]
+    async fn batch_with_events_and_logs_preserves_cursor() {
+        let cursor = Arc::new(InMemoryCursorStore::new());
+        let event = ContractEventRecord {
+            id: Uuid::new_v4(),
+            contract_id: "CA123456789".to_string(),
+            ledger_sequence: 100,
+            transaction_hash: "0xdeadbeef".to_string(),
+            event_index: 0,
+            event_type: "transfer".to_string(),
+            topics: vec!["topic1".to_string()],
+            data: "{\"amount\": 1000}".to_string(),
+        };
+        let log = TransactionLogRecord {
+            contract_id: "CA123456789".to_string(),
+            function_name: "transfer".to_string(),
+            arguments: serde_json::json!({"to": "GB123"}),
+            caller: Some("GA987".to_string()),
+            status: "success".to_string(),
+            gas_used: 12500,
+        };
+
+        let mut batch = LedgerBatch::new(100, 1, 1_700_000_100);
+        batch.events.push(event);
+        batch.logs.push(log);
+
+        cursor.save_batch(&batch).await.unwrap();
+        assert_eq!(cursor.load_cursor().await.unwrap(), Some(100));
+
+        // Test serialization roundtrip
+        let json = serde_json::to_string(&batch).unwrap();
+        let decoded: LedgerBatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.sequence, 100);
+        assert_eq!(decoded.events.len(), 1);
+        assert_eq!(decoded.logs.len(), 1);
+        assert_eq!(decoded.logs[0].gas_used, 12500);
     }
 }
