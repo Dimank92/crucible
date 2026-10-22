@@ -47,6 +47,7 @@ use crate::{
         alerts::ingest_alert,
         dashboard::get_dashboard_metrics,
         dashboard::get_contract_stats,
+        dashboard::get_batch_contract_stats,
         audit::list_audit_reports,
         audit::get_audit_report,
     ),
@@ -57,6 +58,8 @@ use crate::{
         alerts::AlertIngestResponse,
         dashboard::DashboardMetrics,
         dashboard::ContractStats,
+        dashboard::BatchContractStatsRequest,
+        dashboard::BatchContractStatsResponse,
         audit::AuditEventRecord,
         audit::AuditEventRequest,
     )),
@@ -213,6 +216,15 @@ pub fn build_router(
                 .route(
                     "/contracts/:contract_id/stats",
                     get(dashboard::get_contract_stats),
+                )
+                .route(
+                    "/contracts/stats/batch",
+                    post(dashboard::get_batch_contract_stats),
+                )
+                .route(
+                    "/contracts/stats",
+                    get(dashboard::get_batch_contract_stats_query)
+                        .post(dashboard::get_batch_contract_stats),
                 )
                 .with_state(dashboard_state.clone()),
         )
