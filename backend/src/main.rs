@@ -94,11 +94,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let _tracing_guard = TracingService::init(tracing_config)?;
     let _enter = info_span!("app.startup").entered();
 
-    let db_pool = config
-        .database
-        .to_sqlx_pool_options()
-        .connect(&config.database.url)
-        .await?;
+    let db_pool = config.database.create_pool().await?;
     tracing::info!("Database connection established");
 
     let redis_client = RedisClient::open(config.redis.url.clone())?;
