@@ -1,3 +1,9 @@
+## [1.36.5](https://github.com/benelabs/crucible/compare/v1.36.4...v1.36.5) (2026-10-23)
+
+### Bug Fixes
+
+* **deploy-health:** incorporate worker queue backlog and lag into deploy health probe ([#1158](https://github.com/benelabs/crucible/issues/1158)) ([#1340](https://github.com/benelabs/crucible/issues/1340)) ([ddaae3d](https://github.com/benelabs/crucible/commit/ddaae3d91beee29484242d5a7a53302b19e5f4cd))
+
 ## [1.36.4](https://github.com/benelabs/crucible/compare/v1.36.3...v1.36.4) (2026-10-23)
 
 ### Bug Fixes
