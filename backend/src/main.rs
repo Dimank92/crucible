@@ -53,6 +53,7 @@ use tracing::info_span;
         profiling::get_health,
         dashboard::get_dashboard_metrics,
         dashboard::get_contract_stats,
+        dashboard::get_batch_contract_stats,
         audit::list_audit_reports,
         audit::get_audit_report,
     ),
@@ -61,6 +62,8 @@ use tracing::info_span;
         profiling::HealthResponse,
         dashboard::DashboardMetrics,
         dashboard::ContractStats,
+        dashboard::BatchContractStatsRequest,
+        dashboard::BatchContractStatsResponse,
         audit::AuditEventRecord,
         audit::AuditEventRequest,
     )),
@@ -94,11 +97,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let _tracing_guard = TracingService::init(tracing_config)?;
     let _enter = info_span!("app.startup").entered();
 
-    let db_pool = config
-        .database
-        .to_sqlx_pool_options()
-        .connect(&config.database.url)
-        .await?;
+    let db_pool = config.database.create_pool().await?;
     tracing::info!("Database connection established");
 
     let redis_client = RedisClient::open(config.redis.url.clone())?;
@@ -109,7 +108,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let (log_aggregator, log_receiver) = LogAggregator::new();
     let log_aggregator = Arc::new(log_aggregator);
     let sandbox_service = Arc::new(ContractSandboxService::default());
-    let contract_benchmark_service = Arc::new(ContractBenchmarkService::new());
+    let contract_benchmark_service = Arc::new(ContractBenchmarkService::with_db(db_pool.clone()));
     let config_manager = Arc::new(ConfigManager::new(config.clone()));
 
     tokio::spawn(MetricsExporter::run_collector(metrics_exporter.clone()));

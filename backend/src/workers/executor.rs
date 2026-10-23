@@ -46,10 +46,12 @@ pub struct TaskExecutor {
     completed_count: Arc<AtomicU64>,
     /// Atomic counter for failed tasks
     failed_count: Arc<AtomicU64>,
+    /// Per-task execution timeout deadline (default: 5 minutes)
+    task_timeout: Duration,
 }
 
 impl TaskExecutor {
-    /// Create a new TaskExecutor with the specified concurrency limit.
+    /// Create a new TaskExecutor with the specified concurrency limit and default 5-minute timeout.
     ///
     /// # Arguments
     ///
@@ -59,13 +61,24 @@ impl TaskExecutor {
     ///
     /// A new TaskExecutor instance
     pub fn new(max_concurrency: usize) -> Self {
+        Self::with_timeout(max_concurrency, Duration::from_secs(300))
+    }
+
+    /// Create a new TaskExecutor with specified concurrency limit and custom task timeout.
+    pub fn with_timeout(max_concurrency: usize, task_timeout: Duration) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
             max_concurrency,
             running_count: Arc::new(AtomicU64::new(0)),
             completed_count: Arc::new(AtomicU64::new(0)),
             failed_count: Arc::new(AtomicU64::new(0)),
+            task_timeout,
         }
+    }
+
+    /// Returns the configured per-task execution timeout.
+    pub fn task_timeout(&self) -> Duration {
+        self.task_timeout
     }
 
     /// Get the current number of running tasks.
@@ -120,6 +133,7 @@ impl TaskExecutor {
         let running_count = self.running_count.clone();
         let completed_count = self.completed_count.clone();
         let failed_count = self.failed_count.clone();
+        let task_timeout = self.task_timeout;
 
         // Increment running count before attempting to acquire permit
         running_count.fetch_add(1, Ordering::Relaxed);
@@ -130,8 +144,20 @@ impl TaskExecutor {
                 // Acquire semaphore permit (waits if necessary)
                 let permit = semaphore.acquire_owned().await;
 
-                // Execute the task
-                let result = task.await;
+                // Execute the task with bounded timeout enforcement
+                let result = match tokio::time::timeout(task_timeout, task).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        tracing::error!(
+                            timeout_secs = task_timeout.as_secs(),
+                            "Task execution exceeded timeout deadline"
+                        );
+                        Err(AppError::InternalError(format!(
+                            "Task execution timed out after {:?}",
+                            task_timeout
+                        )))
+                    }
+                };
 
                 // Release the permit implicitly when it goes out of scope
                 drop(permit);
@@ -293,5 +319,38 @@ mod tests {
         assert_eq!(executor.running_count(), 0);
         assert_eq!(executor.completed_count(), 3);
         assert_eq!(executor.failed_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_executor_default_timeout() {
+        let executor = TaskExecutor::new(4);
+        assert_eq!(executor.task_timeout(), Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn test_executor_custom_timeout_and_deadline_enforcement() {
+        // Limit concurrency to 1 and timeout to 50ms
+        let executor = TaskExecutor::with_timeout(1, Duration::from_millis(50));
+        assert_eq!(executor.task_timeout(), Duration::from_millis(50));
+
+        // Spawn a task that sleeps longer than timeout (2 seconds)
+        let stuck_handle = executor.execute(Box::pin(async {
+            sleep(Duration::from_secs(2)).await;
+            Ok(())
+        }));
+
+        let stuck_res = stuck_handle.await.unwrap();
+        assert!(stuck_res.is_err(), "Stuck task must fail due to timeout");
+        assert_eq!(executor.failed_count(), 1);
+        assert_eq!(executor.running_count(), 0);
+
+        // Verify concurrency slot is released and not leaked
+        let next_handle = executor.execute(Box::pin(async {
+            Ok(())
+        }));
+        let next_res = next_handle.await.unwrap();
+        assert!(next_res.is_ok(), "Subsequent task must succeed without slot leak");
+        assert_eq!(executor.completed_count(), 1);
+        assert_eq!(executor.running_count(), 0);
     }
 }

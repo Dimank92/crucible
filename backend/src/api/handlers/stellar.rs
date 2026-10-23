@@ -119,21 +119,52 @@ impl FaucetDispenserService {
         }
     }
 
+    pub fn with_config(max_requests: usize, rate_window: Duration) -> Self {
+        let mut s = Self::new();
+        s.max_requests_per_window = max_requests;
+        s.rate_window = rate_window;
+        s
+    }
+
+    /// Evicts all expired IP and account timestamps and removes inactive keys from the rate limiting tables.
+    pub async fn sweep_expired(&self) {
+        let mut limits = self.rate_limits.lock().await;
+        let mut account_limits = self.account_rate_limits.lock().await;
+        let now = Instant::now();
+
+        limits.retain(|_, timestamps| {
+            timestamps.retain(|&t| now.duration_since(t) < self.rate_window);
+            !timestamps.is_empty()
+        });
+        account_limits.retain(|_, timestamps| {
+            timestamps.retain(|&t| now.duration_since(t) < self.rate_window);
+            !timestamps.is_empty()
+        });
+    }
+
     pub async fn check_rate_limit(&self, ip: &str, destination: &str) -> bool {
         let mut limits = self.rate_limits.lock().await;
         let mut account_limits = self.account_rate_limits.lock().await;
         let now = Instant::now();
 
-        // Prune and check IP rate limit
+        // Evict expired entries across the tables to prevent unbounded memory growth
+        limits.retain(|_, timestamps| {
+            timestamps.retain(|&t| now.duration_since(t) < self.rate_window);
+            !timestamps.is_empty()
+        });
+        account_limits.retain(|_, timestamps| {
+            timestamps.retain(|&t| now.duration_since(t) < self.rate_window);
+            !timestamps.is_empty()
+        });
+
+        // Check and record IP rate limit
         let ip_timestamps = limits.entry(ip.to_string()).or_default();
-        ip_timestamps.retain(|&t| now.duration_since(t) < self.rate_window);
         if ip_timestamps.len() >= self.max_requests_per_window {
             return false;
         }
 
-        // Prune and check target account destination rate limit
+        // Check and record target account destination rate limit
         let acc_timestamps = account_limits.entry(destination.to_string()).or_default();
-        acc_timestamps.retain(|&t| now.duration_since(t) < self.rate_window);
         if acc_timestamps.len() >= self.max_requests_per_window {
             return false;
         }
@@ -563,4 +594,29 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("Invalid Stellar memo hash"));
     }
+
+    #[tokio::test]
+    async fn test_rate_limit_table_purges_expired_entries() {
+        let service = FaucetDispenserService::with_config(5, Duration::from_millis(40));
+        let dest = "GBBD67IF6I2E7E5NCTZTTG46YAKMBH2O7662T7O4B5XW4YVRE3L363C6";
+
+        // Insert requests from 5 distinct client IPs
+        for i in 0..5 {
+            let ip = format!("192.168.1.{}", i);
+            assert!(service.check_rate_limit(&ip, dest).await);
+        }
+
+        assert_eq!(service.get_stats().await.rate_limited_ips_count, 5);
+
+        // Wait for rate window to elapse
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Next rate limit check triggers eviction of inactive/expired IP keys
+        assert!(service.check_rate_limit("192.168.1.100", dest).await);
+
+        // Previous 5 IPs were purged; only the new active IP remains
+        let stats = service.get_stats().await;
+        assert_eq!(stats.rate_limited_ips_count, 1);
+    }
 }
+
