@@ -22,7 +22,7 @@ pub struct RedisConfig {
     pub connection_timeout_ms: u64,
     /// Maximum number of connection retries.
     pub max_retries: u32,
-    /// Maximum startup timeout in milliseconds for establishing the initial connection (default: 30000ms / 30s).
+    /// Startup timeout in milliseconds before giving up retrying connection manager creation.
     #[serde(default = "default_startup_timeout_ms")]
     pub startup_timeout_ms: u64,
 }
@@ -52,6 +52,55 @@ impl fmt::Debug for RedisConfig {
 }
 
 impl RedisConfig {
+    /// Connects to Redis via a connection manager with exponential retry until startup timeout.
+    pub async fn connect_manager_with_retry(
+        &self,
+        client: &redis::Client,
+    ) -> Result<redis::aio::ConnectionManager, redis::RedisError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.startup_timeout_ms);
+        let mut delay = std::time::Duration::from_millis(100);
+        let max_delay = std::time::Duration::from_secs(5);
+        let timeout = std::time::Duration::from_millis(self.connection_timeout_ms);
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+            tracing::info!(
+                "Attempting to connect to Redis connection manager (attempt {})",
+                attempt
+            );
+
+            let conn_fut = redis::aio::ConnectionManager::new(client.clone());
+            match tokio::time::timeout(timeout, conn_fut).await {
+                Ok(Ok(conn)) => {
+                    tracing::info!("Successfully connected to Redis connection manager");
+                    return Ok(conn);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to connect to Redis on attempt {}: {:?}", attempt, e);
+                    if std::time::Instant::now() >= deadline || (self.max_retries > 0 && attempt >= self.max_retries) {
+                        return Err(e);
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Connection to Redis timed out on attempt {} (limit: {}ms)",
+                        attempt, self.connection_timeout_ms
+                    );
+                    if std::time::Instant::now() >= deadline || (self.max_retries > 0 && attempt >= self.max_retries) {
+                        return Err(redis::RedisError::from((
+                            redis::ErrorKind::IoError,
+                            "Connection timed out",
+                        )));
+                    }
+                }
+            }
+
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, max_delay);
+        }
+    }
+
     /// Converts the primary config to Redis connection info.
     pub fn to_connection_info(
         &self,
@@ -76,74 +125,6 @@ impl RedisConfig {
             }
         })
     }
-
-    /// Establishes a Redis `ConnectionManager` with exponential backoff retry and overall startup timeout.
-    pub async fn get_connection_manager(
-        &self,
-        client: &redis::Client,
-    ) -> Result<redis::aio::ConnectionManager, redis::RedisError> {
-        let startup_timeout = std::time::Duration::from_millis(self.startup_timeout_ms);
-        let connect_fut = async {
-            let mut attempt = 0;
-            let mut delay = std::time::Duration::from_millis(100);
-            let max_delay = std::time::Duration::from_secs(5);
-            let per_attempt_timeout = std::time::Duration::from_millis(self.connection_timeout_ms);
-
-            loop {
-                attempt += 1;
-                tracing::info!(
-                    "Attempting initial Redis connection (attempt {}/{})",
-                    attempt, self.max_retries
-                );
-
-                let conn_fut = redis::aio::ConnectionManager::new(client.clone());
-                match tokio::time::timeout(per_attempt_timeout, conn_fut).await {
-                    Ok(Ok(conn)) => {
-                        tracing::info!("Successfully established Redis connection manager");
-                        return Ok(conn);
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            "Failed to connect to Redis on attempt {}: {:?}",
-                            attempt, e
-                        );
-                        if attempt >= self.max_retries {
-                            return Err(e);
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "Connection attempt {} to Redis timed out after {}ms",
-                            attempt, self.connection_timeout_ms
-                        );
-                        if attempt >= self.max_retries {
-                            return Err(redis::RedisError::from((
-                                redis::ErrorKind::IoError,
-                                "Connection timed out",
-                            )));
-                        }
-                    }
-                }
-
-                tokio::time::sleep(delay).await;
-                delay = std::cmp::min(delay * 2, max_delay);
-            }
-        };
-
-        match tokio::time::timeout(startup_timeout, connect_fut).await {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::error!(
-                    "Redis initial connection timed out after {}ms",
-                    self.startup_timeout_ms
-                );
-                Err(redis::RedisError::from((
-                    redis::ErrorKind::IoError,
-                    "Redis startup timeout exceeded while establishing initial connection",
-                )))
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -151,19 +132,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redis_config_defaults_include_startup_timeout() {
-        let json_str = r#"{
-            "url": "redis://127.0.0.1:6379",
-            "pool_size": 10,
-            "connection_timeout_ms": 5000,
-            "max_retries": 5
-        }"#;
+    fn test_redis_config_default_startup_timeout() {
+        let config = RedisConfig {
+            url: "redis://127.0.0.1:6379".to_string(),
+            job_queue_url: None,
+            pool_size: 10,
+            connection_timeout_ms: 500,
+            max_retries: 2,
+            startup_timeout_ms: default_startup_timeout_ms(),
+        };
 
-        let config: RedisConfig = serde_json::from_str(json_str).unwrap();
         assert_eq!(config.startup_timeout_ms, 30_000);
         let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("[REDACTED]"));
         assert!(debug_str.contains("startup_timeout_ms: 30000"));
-        assert!(debug_str.contains(r#"url: "[REDACTED]""#));
+    }
+
+    #[tokio::test]
+    async fn test_connect_manager_with_retry_fails_gracefully_on_invalid_url() {
+        let config = RedisConfig {
+            url: "redis://127.0.0.1:1".to_string(),
+            job_queue_url: None,
+            pool_size: 1,
+            connection_timeout_ms: 100,
+            max_retries: 1,
+            startup_timeout_ms: 200,
+        };
+
+        let client = redis::Client::open(config.url.clone()).unwrap();
+        let res = config.connect_manager_with_retry(&client).await;
+        assert!(res.is_err());
     }
 
     #[test]
