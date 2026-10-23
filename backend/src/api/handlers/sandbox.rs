@@ -108,6 +108,9 @@ fn map_sandbox_error(error: SandboxError) -> ApiError {
             }
         }
         SandboxError::TimedOut(message) => ApiError::Internal(message.to_string()),
+        SandboxError::FuelExhausted(limit) => ApiError::Validation(format!(
+            "execution exceeded {limit} CPU instruction fuel limit"
+        )),
         SandboxError::Worker(message) => ApiError::Internal(message),
     }
 }
@@ -324,5 +327,61 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn route_maps_fuel_exhausted_service_response() {
+        struct FuelExhaustedMock;
+        impl ContractExecutor for FuelExhaustedMock {
+            fn execute(&self, execution: PreparedExecution) -> Result<RawExecution, SandboxError> {
+                Err(SandboxError::FuelExhausted(
+                    execution.limits.max_cpu_instructions,
+                ))
+            }
+        }
+
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(FuelExhaustedMock),
+        ));
+        let app = routes(service);
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": []
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["status"], "fuel_exhausted");
+        assert_eq!(json["data"]["cpu_instructions"], 25_000_000);
+    }
+
+    #[test]
+    fn test_map_sandbox_error_fuel_exhausted() {
+        let err = SandboxError::FuelExhausted(50_000);
+        let api_err = map_sandbox_error(err);
+        match api_err {
+            crate::api::contracts::ApiError::Validation(msg) => {
+                assert!(msg.contains("50000"));
+                assert!(msg.contains("fuel limit"));
+            }
+            _ => panic!("expected Validation error"),
+        }
     }
 }
