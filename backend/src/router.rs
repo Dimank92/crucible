@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use redis::Client as RedisClient;
@@ -121,6 +121,17 @@ pub fn build_router(
         .route("/system-stats", get(admin::get_system_stats))
         .route("/maintenance", post(admin::set_maintenance_mode))
         .route("/logs", get(admin::get_admin_logs))
+        .route(
+            "/users/:id/role",
+            put(admin::update_user_role)
+                .post(admin::update_user_role)
+                .get(admin::get_user_role),
+        )
+        .route("/roles/elevate", post(admin::elevate_user_role))
+        .route(
+            "/audit/role-elevations",
+            get(admin::get_role_elevation_audit_logs),
+        )
         .with_state(profiling_state.clone());
 
     let cors = build_cors_layer(config);
