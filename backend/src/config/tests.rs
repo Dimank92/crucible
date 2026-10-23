@@ -281,3 +281,28 @@ fn test_production_rejects_empty_cors_origins() {
         },
     );
 }
+
+#[test]
+fn test_cors_rejects_wildcard_with_credentials_in_development_and_staging() {
+    temp_env::with_vars(
+        [
+            ("APP_CORS__ALLOWED_ORIGINS__0", Some("*")),
+            ("APP_CORS__ALLOW_CREDENTIALS", Some("true")),
+        ],
+        || {
+            let err = AppConfig::load(Environment::Development)
+                .expect_err("Should fail with wildcard origin and allow_credentials=true in development");
+
+            match err {
+                crate::config::ConfigError::ValidationError(errors) => {
+                    assert!(
+                        errors.iter().any(|e| e.contains("AllowOrigin::any() / '*' is strictly prohibited")),
+                        "Expected CORS wildcard with credentials error, got: {:?}",
+                        errors
+                    );
+                }
+                _ => panic!("Expected ValidationError, got {:?}", err),
+            }
+        },
+    );
+}

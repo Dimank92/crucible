@@ -285,7 +285,12 @@ async fn security_headers_middleware(
 }
 
 fn build_cors_layer(config: &AppConfig) -> CorsLayer {
-    if config.cors.allowed_origins.contains(&"*".to_string()) {
+    // Explicitly validate CORS invariants: reject wildcard origin with allow_credentials across all environments.
+    if let Err(e) = config.cors.validate() {
+        panic!("Invalid CORS configuration: {e}");
+    }
+
+    if config.cors.is_wildcard_origin() {
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -300,10 +305,14 @@ fn build_cors_layer(config: &AppConfig) -> CorsLayer {
                     .unwrap_or_else(|_| panic!("Invalid CORS origin: {}", o))
             })
             .collect();
-        CorsLayer::new()
+        let mut layer = CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))
             .allow_methods(Any)
-            .allow_headers(Any)
+            .allow_headers(Any);
+        if config.cors.allow_credentials {
+            layer = layer.allow_credentials(true);
+        }
+        layer
     }
 }
 
