@@ -835,6 +835,18 @@ fn expand_quickcheck(
     let doc_attrs = attrs.iter().filter(|attr| attr.path().is_ident("doc"));
     let other_attrs = attrs.iter().filter(|attr| !attr.path().is_ident("doc"));
 
+    // Normalize parameter bindings into fresh identifiers for the closure header,
+    // and emit a preamble destructuring statement `let #pat = #ident;` so that
+    // mutable bindings (`mut x`), ref bindings (`ref x`), and structured patterns
+    // (`Point { x, y }`, `(a, b)`) expand cleanly inside the closure body.
+    let arg_idents: Vec<syn::Ident> = (0..patterns.len())
+        .map(|i| syn::Ident::new(&format!("__arg_{}", i), proc_macro2::Span::call_site()))
+        .collect();
+    let preamble = quote! {
+        #( let #patterns = #arg_idents; )*
+    };
+    let block_stmts = &block.stmts;
+
     Ok(quote! {
         #(#doc_attrs)*
         #(#other_attrs)*
@@ -850,7 +862,10 @@ fn expand_quickcheck(
                     #max_depth
                     ..::core::default::Default::default()
                 },
-                |( #(#patterns,)* )| #block,
+                |( #( #arg_idents, )* )| {
+                    #preamble
+                    #(#block_stmts)*
+                },
             );
         }
     })
@@ -861,6 +876,7 @@ mod tests {
     use super::*;
 
     #[test]
+
     fn test_fixture_derive_hygienic_contract_client_expansion() {
         let input: syn::DeriveInput = syn::parse_quote! {
             struct MyFixture {
@@ -974,6 +990,38 @@ mod tests {
         let err_msg = diagnostics(&err);
         assert!(err_msg.contains("#[fixture] takes no arguments other than `requires = [..]`"));
         assert!(err_msg.contains("note: expected syntax is `#[fixture(requires = [..])]`"));
+
+fn test_quickcheck_pattern_destructuring() {
+        let input: syn::ItemFn = syn::parse_quote! {
+            fn test_prop(mut x: u32, ref y: u32, (a, b): (u32, u32)) {
+                x += 1;
+                let _ = *y;
+                let _ = a + b;
+            }
+        };
+        let config = QuickcheckArgs::default();
+        let expanded = expand_quickcheck(config, input).expect("expand_quickcheck should succeed");
+        let expanded_str = expanded.to_string();
+
+        // Must normalize patterns to __arg_N in closure parameter tuple
+        // and emit preamble let-destructuring statements
+        assert!(
+            expanded_str.contains("__arg_0"),
+            "expanded tokens missing __arg_0: {expanded_str}"
+        );
+        assert!(
+            expanded_str.contains("let mut x = __arg_0 ;"),
+            "expanded tokens missing let mut x: {expanded_str}"
+        );
+        assert!(
+            expanded_str.contains("let ref y = __arg_1 ;"),
+            "expanded tokens missing let ref y: {expanded_str}"
+        );
+        assert!(
+            expanded_str.contains("let (a , b) = __arg_2 ;"),
+            "expanded tokens missing let (a, b): {expanded_str}"
+        );
+
     }
 }
 
