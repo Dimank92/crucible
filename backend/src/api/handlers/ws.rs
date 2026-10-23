@@ -14,7 +14,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -25,6 +25,7 @@ use crate::services::{
 
 const PUSH_INTERVAL_SECS: u64 = 5;
 const PING_INTERVAL_SECS: u64 = 30;
+const PONG_TIMEOUT_SECS: u64 = 60;
 
 /// Shared state required by the WebSocket handler.
 #[derive(Clone)]
@@ -61,6 +62,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     let mut ping_ticker = interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut last_pong_received = Instant::now();
+
     loop {
         tokio::select! {
             _ = push_ticker.tick() => {
@@ -86,6 +89,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
             }
 
             _ = ping_ticker.tick() => {
+                // Enforce heartbeat deadline: if client has not replied with pong within timeout, terminate zombie connection
+                if last_pong_received.elapsed() > Duration::from_secs(PONG_TIMEOUT_SECS) {
+                    warn!(
+                        elapsed_secs = last_pong_received.elapsed().as_secs(),
+                        timeout_secs = PONG_TIMEOUT_SECS,
+                        "WebSocket client heartbeat deadline exceeded (missing pong), tearing down zombie connection"
+                    );
+                    break;
+                }
+
                 if sender.send(Message::Ping(vec![].into())).await.is_err() {
                     debug!("WebSocket client disconnected (ping failed), dropping stream");
                     break;
@@ -100,6 +113,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                     }
                     Some(Ok(Message::Pong(_))) => {
                         debug!("Received pong from WebSocket client");
+                        last_pong_received = Instant::now();
                     }
                     Some(Err(e)) => {
                         warn!(error = %e, "WebSocket receive error, tearing down connection");
@@ -131,5 +145,19 @@ mod tests {
         let json = serde_json::to_string(&update).unwrap();
         assert!(json.contains("dashboard_update"));
         assert!(json.contains("active_errors"));
+    }
+
+    #[test]
+    fn test_pong_timeout_configuration() {
+        assert!(PONG_TIMEOUT_SECS > PING_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn test_pong_heartbeat_deadline_detection() {
+        let last_pong = Instant::now() - Duration::from_secs(PONG_TIMEOUT_SECS + 5);
+        assert!(last_pong.elapsed() > Duration::from_secs(PONG_TIMEOUT_SECS));
+
+        let recent_pong = Instant::now();
+        assert!(recent_pong.elapsed() <= Duration::from_secs(PONG_TIMEOUT_SECS));
     }
 }
