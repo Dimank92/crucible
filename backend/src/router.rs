@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use redis::Client as RedisClient;
@@ -26,10 +26,8 @@ use crate::{
         dashboard::get_dashboard, errors, profiling, sandbox, stellar, ws::ws_dashboard_handler,
     },
     api::middleware::{
-        content_type::require_json_content_type,
-        idempotency::idempotency_middleware,
-        logging::logging_middleware,
-        request_id::request_id_middleware,
+        content_type::require_json_content_type, idempotency::idempotency_middleware,
+        logging::logging_middleware, request_id::request_id_middleware,
     },
     app_state::ApplicationStates,
     config::{
@@ -47,6 +45,7 @@ use crate::{
         alerts::ingest_alert,
         dashboard::get_dashboard_metrics,
         dashboard::get_contract_stats,
+        dashboard::get_batch_contract_stats,
         audit::list_audit_reports,
         audit::get_audit_report,
     ),
@@ -57,6 +56,8 @@ use crate::{
         alerts::AlertIngestResponse,
         dashboard::DashboardMetrics,
         dashboard::ContractStats,
+        dashboard::BatchContractStatsRequest,
+        dashboard::BatchContractStatsResponse,
         audit::AuditEventRecord,
         audit::AuditEventRequest,
     )),
@@ -91,7 +92,10 @@ pub fn build_router(
         audit: audit_service,
     } = states;
 
-    let dlq_coordinator = Arc::new(crate::workers::retry::DlqCoordinator::new(Arc::new(redis_client.clone())));
+    let dlq_coordinator = Arc::new(crate::workers::retry::DlqCoordinator::new(Arc::new(
+        redis_client.clone(),
+    )));
+    let _ = stellar::init_faucet_pool_with_redis(redis_client.clone());
 
     let contracts_router = Router::new()
         .route("/compile", post(contract_handlers::compile_contract))
@@ -118,6 +122,17 @@ pub fn build_router(
         .route("/system-stats", get(admin::get_system_stats))
         .route("/maintenance", post(admin::set_maintenance_mode))
         .route("/logs", get(admin::get_admin_logs))
+        .route(
+            "/users/:id/role",
+            put(admin::update_user_role)
+                .post(admin::update_user_role)
+                .get(admin::get_user_role),
+        )
+        .route("/roles/elevate", post(admin::elevate_user_role))
+        .route(
+            "/audit/role-elevations",
+            get(admin::get_role_elevation_audit_logs),
+        )
         .with_state(profiling_state.clone());
 
     let cors = build_cors_layer(config);
@@ -127,7 +142,10 @@ pub fn build_router(
         .route("/metrics", get(profiling::get_prometheus_metrics))
         .route("/.well-known/stellar.toml", get(stellar::get_stellar_toml))
         .route("/api/stellar/faucet", post(stellar::fund_testnet_account))
-        .route("/api/stellar/faucet/status", get(stellar::get_faucet_status))
+        .route(
+            "/api/stellar/faucet/status",
+            get(stellar::get_faucet_status),
+        )
         .route("/api/v1/faucet", post(stellar::fund_testnet_account))
         .route("/api/v1/faucet/status", get(stellar::get_faucet_status))
         .merge(
@@ -149,49 +167,68 @@ pub fn build_router(
             Router::new()
                 .route(
                     "/metrics",
-                    get(|state: axum::extract::State<std::sync::Arc<crate::api::handlers::profiling::AppState>>| async move {
-                        profiling::get_metrics(state).await
-                    }),
+                    get(
+                        |state: axum::extract::State<
+                            std::sync::Arc<crate::api::handlers::profiling::AppState>,
+                        >| async move { profiling::get_metrics(state).await },
+                    ),
                 )
                 .route(
                     "/health",
-                    get(|state: axum::extract::State<std::sync::Arc<crate::api::handlers::profiling::AppState>>| async move {
-                        profiling::get_health(state).await
-                    }),
+                    get(
+                        |state: axum::extract::State<
+                            std::sync::Arc<crate::api::handlers::profiling::AppState>,
+                        >| async move { profiling::get_health(state).await },
+                    ),
                 )
                 .route("/prometheus", get(profiling::get_prometheus_metrics))
                 .route(
                     "/status",
-                    get(|state: axum::extract::State<std::sync::Arc<crate::api::handlers::profiling::AppState>>| async move {
-                        profiling::get_system_status(state).await
-                    }),
+                    get(
+                        |state: axum::extract::State<
+                            std::sync::Arc<crate::api::handlers::profiling::AppState>,
+                        >| async move {
+                            profiling::get_system_status(state).await
+                        },
+                    ),
                 )
                 .route(
                     "/profile",
-                    post(|state: axum::extract::State<std::sync::Arc<crate::api::handlers::profiling::AppState>>| async move {
-                        profiling::trigger_profile_collection(
-                            state,
-                            crate::api::contracts::ValidatedJson(crate::api::contracts::ProfileTriggerRequest {
-                                label: String::new(),
-                                duration_secs: 0,
-                                sample_rate_hz: 100,
-                            }),
-                        )
-                        .await
-                    }),
+                    post(
+                        |state: axum::extract::State<
+                            std::sync::Arc<crate::api::handlers::profiling::AppState>,
+                        >| async move {
+                            profiling::trigger_profile_collection(
+                                state,
+                                crate::api::contracts::ValidatedJson(
+                                    crate::api::contracts::ProfileTriggerRequest {
+                                        label: String::new(),
+                                        duration_secs: 0,
+                                        sample_rate_hz: 100,
+                                    },
+                                ),
+                            )
+                            .await
+                        },
+                    ),
                 )
                 .route(
                     "/contracts/benchmark",
-                    post(|state: axum::extract::State<std::sync::Arc<crate::api::handlers::profiling::AppState>>| async move {
-                        let payload = crate::services::contract_benchmark::ContractBenchmarkRequest {
-                            contract_id: "demo".to_string(),
-                            benchmark_name: "smoke".to_string(),
-                            samples: vec![],
-                            baseline: None,
-                            thresholds: None,
-                        };
-                        profiling::run_contract_benchmark(state, axum::Json(payload)).await
-                    }),
+                    post(
+                        |state: axum::extract::State<
+                            std::sync::Arc<crate::api::handlers::profiling::AppState>,
+                        >| async move {
+                            let payload =
+                                crate::services::contract_benchmark::ContractBenchmarkRequest {
+                                    contract_id: "demo".to_string(),
+                                    benchmark_name: "smoke".to_string(),
+                                    samples: vec![],
+                                    baseline: None,
+                                    thresholds: None,
+                                };
+                            profiling::run_contract_benchmark(state, axum::Json(payload)).await
+                        },
+                    ),
                 )
                 .with_state(profiling_state.clone()),
         )
@@ -199,10 +236,21 @@ pub fn build_router(
         .route("/api/profile", post(profiling::trigger_profile_collection))
         .route(
             "/api/alerts/ingest",
-            post(alerts::ingest_alert).route_layer(middleware::from_fn_with_state(
-                profiling_state.clone(),
-                idempotency_middleware,
-            )),
+            post(alerts::ingest_alert)
+                .route_layer(middleware::from_fn_with_state(
+                    profiling_state.clone(),
+                    idempotency_middleware,
+                ))
+                .route_layer(middleware::from_fn(alerts::alert_auth_middleware)),
+        )
+        .route(
+            "/api/v1/alerts/ingest",
+            post(alerts::ingest_alert)
+                .route_layer(middleware::from_fn_with_state(
+                    profiling_state.clone(),
+                    idempotency_middleware,
+                ))
+                .route_layer(middleware::from_fn(alerts::alert_auth_middleware)),
         )
         .with_state(profiling_state.clone())
         .nest(
@@ -213,6 +261,15 @@ pub fn build_router(
                 .route(
                     "/contracts/:contract_id/stats",
                     get(dashboard::get_contract_stats),
+                )
+                .route(
+                    "/contracts/stats/batch",
+                    post(dashboard::get_batch_contract_stats),
+                )
+                .route(
+                    "/contracts/stats",
+                    get(dashboard::get_batch_contract_stats_query)
+                        .post(dashboard::get_batch_contract_stats),
                 )
                 .with_state(dashboard_state.clone()),
         )
@@ -230,8 +287,15 @@ pub fn build_router(
             "/api/v1/coverage",
             Router::new()
                 .route("/", post(coverage::submit_coverage))
-                .route("/:contract_id/history", get(coverage::get_coverage_progression))
-                .route("/progression/:contract_id", get(coverage::get_coverage_progression))
+                .route("/lcov", post(coverage::submit_lcov_coverage))
+                .route(
+                    "/:contract_id/history",
+                    get(coverage::get_coverage_progression),
+                )
+                .route(
+                    "/progression/:contract_id",
+                    get(coverage::get_coverage_progression),
+                )
                 .route("/:project", get(coverage::get_latest_coverage))
                 .with_state(coverage_state),
         )
@@ -286,7 +350,12 @@ async fn security_headers_middleware(
 }
 
 fn build_cors_layer(config: &AppConfig) -> CorsLayer {
-    if config.cors.allowed_origins.contains(&"*".to_string()) {
+    // Explicitly validate CORS invariants: reject wildcard origin with allow_credentials across all environments.
+    if let Err(e) = config.cors.validate() {
+        panic!("Invalid CORS configuration: {e}");
+    }
+
+    if config.cors.is_wildcard_origin() {
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -301,10 +370,14 @@ fn build_cors_layer(config: &AppConfig) -> CorsLayer {
                     .unwrap_or_else(|_| panic!("Invalid CORS origin: {}", o))
             })
             .collect();
-        CorsLayer::new()
+        let mut layer = CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))
             .allow_methods(Any)
-            .allow_headers(Any)
+            .allow_headers(Any);
+        if config.cors.allow_credentials {
+            layer = layer.allow_credentials(true);
+        }
+        layer
     }
 }
 
@@ -316,8 +389,7 @@ mod tests {
         config::Environment,
         services::{
             contract_benchmark::ContractBenchmarkService, error_recovery::ErrorManager,
-            log_aggregator::LogAggregator, log_alerts::AlertManager,
-            sys_metrics::MetricsExporter,
+            log_aggregator::LogAggregator, log_alerts::AlertManager, sys_metrics::MetricsExporter,
         },
     };
     use axum::{body::Body, http::Request};
@@ -395,7 +467,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
     }
 
     #[tokio::test]
@@ -412,6 +487,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
     }
 }
