@@ -1,3 +1,9 @@
+## [1.36.0](https://github.com/benelabs/crucible/compare/v1.35.0...v1.36.0) (2026-10-23)
+
+### Features
+
+* **backend:** connection acquire timeout, tcp keepalive, redis startup retry, and http2 stream limits ([#1247](https://github.com/benelabs/crucible/issues/1247), [#1248](https://github.com/benelabs/crucible/issues/1248), [#1249](https://github.com/benelabs/crucible/issues/1249), [#1250](https://github.com/benelabs/crucible/issues/1250)) ([0a37c8f](https://github.com/benelabs/crucible/commit/0a37c8f4bf2f55a76e5ee506407b6fa7101a1fa8))
+
 ## [1.35.0](https://github.com/benelabs/crucible/compare/v1.34.2...v1.35.0) (2026-10-22)
 
 ### Features
