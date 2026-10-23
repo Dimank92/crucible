@@ -213,10 +213,21 @@ pub fn build_router(
         .route("/api/profile", post(profiling::trigger_profile_collection))
         .route(
             "/api/alerts/ingest",
-            post(alerts::ingest_alert).route_layer(middleware::from_fn_with_state(
-                profiling_state.clone(),
-                idempotency_middleware,
-            )),
+            post(alerts::ingest_alert)
+                .route_layer(middleware::from_fn_with_state(
+                    profiling_state.clone(),
+                    idempotency_middleware,
+                ))
+                .route_layer(middleware::from_fn(alerts::alert_auth_middleware)),
+        )
+        .route(
+            "/api/v1/alerts/ingest",
+            post(alerts::ingest_alert)
+                .route_layer(middleware::from_fn_with_state(
+                    profiling_state.clone(),
+                    idempotency_middleware,
+                ))
+                .route_layer(middleware::from_fn(alerts::alert_auth_middleware)),
         )
         .with_state(profiling_state.clone())
         .nest(
