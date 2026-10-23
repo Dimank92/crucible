@@ -1,3 +1,10 @@
+## [1.36.7](https://github.com/benelabs/crucible/compare/v1.36.6...v1.36.7) (2026-10-23)
+
+### Bug Fixes
+
+* **sandbox:** enforce CPU instruction fuel metering and map fuel exhaustion ([#1138](https://github.com/benelabs/crucible/issues/1138)) ([#1343](https://github.com/benelabs/crucible/issues/1343)) ([db171fb](https://github.com/benelabs/crucible/commit/db171fbd80d0ecaf2be1749ddfb3554034c4efcc))
+* **webhook:** protect against DNS rebinding SSRF via public IP pinning and explicit Host header ([#1182](https://github.com/benelabs/crucible/issues/1182)) ([#1345](https://github.com/benelabs/crucible/issues/1345)) ([b7becd9](https://github.com/benelabs/crucible/commit/b7becd9436e1f2ea03726209ffe36518cbc66b66))
+
 ## [1.36.6](https://github.com/benelabs/crucible/compare/v1.36.5...v1.36.6) (2026-10-23)
 
 ### Bug Fixes
