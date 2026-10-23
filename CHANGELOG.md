@@ -1,3 +1,9 @@
+## [1.36.9](https://github.com/benelabs/crucible/compare/v1.36.8...v1.36.9) (2026-10-23)
+
+### Bug Fixes
+
+* **alerts:** enforce 5-minute sliding-window deduplication on ingested alerts ([#1152](https://github.com/benelabs/crucible/issues/1152)) ([#1348](https://github.com/benelabs/crucible/issues/1348)) ([98ecdb5](https://github.com/benelabs/crucible/commit/98ecdb52e99fca6412d54626d4cc2bd68f670620))
+
 ## [1.36.8](https://github.com/benelabs/crucible/compare/v1.36.7...v1.36.8) (2026-10-23)
 
 ### Bug Fixes
