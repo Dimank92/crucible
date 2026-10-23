@@ -163,4 +163,18 @@ mod tests {
         let res = config.connect_manager_with_retry(&client).await;
         assert!(res.is_err());
     }
+
+    #[test]
+    fn redis_config_custom_startup_timeout() {
+        let json_str = r#"{
+            "url": "redis://127.0.0.1:6379",
+            "pool_size": 10,
+            "connection_timeout_ms": 2000,
+            "max_retries": 10,
+            "startup_timeout_ms": 60000
+        }"#;
+
+        let config: RedisConfig = serde_json::from_str(json_str).unwrap();
+        assert_eq!(config.startup_timeout_ms, 60_000);
+    }
 }
