@@ -1,3 +1,18 @@
+## [1.36.1](https://github.com/benelabs/crucible/compare/v1.36.0...v1.36.1) (2026-10-23)
+
+### Bug Fixes
+
+* **auth:** enforce JWT issuer and audience verification ([#1161](https://github.com/benelabs/crucible/issues/1161)) ([#1187](https://github.com/benelabs/crucible/issues/1187)) ([78d9c7d](https://github.com/benelabs/crucible/commit/78d9c7d236f3252c8a3a089c6adcabfb5a7df3f4))
+* **crucible-macros:** normalize fixture paths for cycle detection and preserve parse errors ([#1134](https://github.com/benelabs/crucible/issues/1134)) ([21bb2f9](https://github.com/benelabs/crucible/commit/21bb2f91a165268c91edd78cc2372119d6ca8dd3))
+* **insurance:** invoke reentrancy guard in state-mutating methods ([#1084](https://github.com/benelabs/crucible/issues/1084)) ([#1132](https://github.com/benelabs/crucible/issues/1132)) ([e5fdca1](https://github.com/benelabs/crucible/commit/e5fdca199c35ba22e1f6476338679c41db710353))
+* **logging:** redact sensitive credentials and query parameters in HTTP logs ([#1167](https://github.com/benelabs/crucible/issues/1167)) ([#1190](https://github.com/benelabs/crucible/issues/1190)) ([71f2626](https://github.com/benelabs/crucible/commit/71f2626d40159bf1eeb167a552db083a38ee5cfd))
+* **middleware:** enforce strict Content-Type validation and handle media parameters ([#1168](https://github.com/benelabs/crucible/issues/1168)) ([#1188](https://github.com/benelabs/crucible/issues/1188)) ([08055b5](https://github.com/benelabs/crucible/commit/08055b508a764cc60b2d9d83e5f15e17c33e0cbf))
+* **stellar:** evict expired IP and account keys in faucet rate limiter ([#1145](https://github.com/benelabs/crucible/issues/1145)) ([#1196](https://github.com/benelabs/crucible/issues/1196)) ([af160e9](https://github.com/benelabs/crucible/commit/af160e95dfcaf330cceca6d2cd3562e0162de2a4))
+* **storage_size:** replace unsafe pointer cast with StorageSize trait ([#1135](https://github.com/benelabs/crucible/issues/1135)) ([c9219f3](https://github.com/benelabs/crucible/commit/c9219f3bef546f03704a2f4adbe1440189efa3ab))
+* **versioning:** conform SemVer ordering parser to ignore build metadata ([#1177](https://github.com/benelabs/crucible/issues/1177)) ([#1191](https://github.com/benelabs/crucible/issues/1191)) ([55ec6d6](https://github.com/benelabs/crucible/commit/55ec6d64c1071742bd0e74b9a39a9da5521246a6))
+* **webhook:** enforce minimum backoff floor in jitter calculation ([#1181](https://github.com/benelabs/crucible/issues/1181)) ([#1189](https://github.com/benelabs/crucible/issues/1189)) ([99ccf5b](https://github.com/benelabs/crucible/commit/99ccf5b3f0a5bb638efdaa8c1b34386da74f95fb))
+* **ws:** enforce pong heartbeat deadline on websocket connection stream ([#1142](https://github.com/benelabs/crucible/issues/1142)) ([#1195](https://github.com/benelabs/crucible/issues/1195)) ([0da96d2](https://github.com/benelabs/crucible/commit/0da96d2d3b1b4e3cc8842bf7546ee55a460ff6a4))
+
 ## [1.36.0](https://github.com/benelabs/crucible/compare/v1.35.0...v1.36.0) (2026-10-23)
 
 ### Features
