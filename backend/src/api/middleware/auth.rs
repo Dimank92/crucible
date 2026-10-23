@@ -85,6 +85,12 @@ struct JwtClaims {
     /// Optional role claim (`admin`, `user`, …).
     #[serde(default)]
     role: Option<String>,
+    /// Optional issuer claim (`iss`).
+    #[serde(default)]
+    iss: Option<String>,
+    /// Optional audience claim (`aud`).
+    #[serde(default)]
+    aud: Option<String>,
 }
 
 /// Registry mapping bearer tokens to the principals they authenticate, plus
@@ -98,6 +104,10 @@ pub struct AdminAuthState {
     /// HS256 secret used to verify JWT bearer tokens. When unset, only the
     /// static token registry is consulted.
     jwt_secret: Option<String>,
+    /// Expected issuer claim (`iss`) for JWT verification.
+    jwt_issuer: Option<String>,
+    /// Expected audience claim (`aud`) for JWT verification.
+    jwt_audience: Option<String>,
     /// Redis client used for `jti` blocklist lookups. When unset, JWT
     /// revocation checks are skipped (signature/expiry are still enforced).
     redis: Option<redis::Client>,
@@ -120,6 +130,24 @@ impl AdminAuthState {
         let secret = secret.into();
         if !secret.trim().is_empty() {
             self.jwt_secret = Some(secret);
+        }
+        self
+    }
+
+    /// Attach the expected JWT issuer claim (`iss`).
+    pub fn with_jwt_issuer(mut self, issuer: impl Into<String>) -> Self {
+        let issuer = issuer.into();
+        if !issuer.trim().is_empty() {
+            self.jwt_issuer = Some(issuer);
+        }
+        self
+    }
+
+    /// Attach the expected JWT audience claim (`aud`).
+    pub fn with_jwt_audience(mut self, audience: impl Into<String>) -> Self {
+        let audience = audience.into();
+        if !audience.trim().is_empty() {
+            self.jwt_audience = Some(audience);
         }
         self
     }
@@ -163,6 +191,14 @@ impl AdminAuthState {
 
         if let Ok(secret) = std::env::var("JWT_SECRET") {
             state = state.with_jwt_secret(secret);
+        }
+
+        if let Ok(issuer) = std::env::var("JWT_ISSUER") {
+            state = state.with_jwt_issuer(issuer);
+        }
+
+        if let Ok(audience) = std::env::var("JWT_AUDIENCE") {
+            state = state.with_jwt_audience(audience);
         }
 
         if let Ok(url) = std::env::var("REDIS_URL") {
@@ -228,7 +264,13 @@ fn b64url_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// Verify an HS256 JWT and return its claims, or `None` on any failure.
-fn verify_hs256_jwt(token: &str, secret: &str) -> Option<JwtClaims> {
+/// When `expected_issuer` or `expected_audience` are specified, matching claims are strictly required.
+fn verify_hs256_jwt(
+    token: &str,
+    secret: &str,
+    expected_issuer: Option<&str>,
+    expected_audience: Option<&str>,
+) -> Option<JwtClaims> {
     let mut parts = token.split('.');
     let header = parts.next()?;
     let payload = parts.next()?;
@@ -252,6 +294,18 @@ fn verify_hs256_jwt(token: &str, secret: &str) -> Option<JwtClaims> {
     if let Some(exp) = claims.exp {
         let now = chrono::Utc::now().timestamp();
         if now >= exp {
+            return None;
+        }
+    }
+
+    if let Some(expected_iss) = expected_issuer {
+        if claims.iss.as_deref() != Some(expected_iss) {
+            return None;
+        }
+    }
+
+    if let Some(expected_aud) = expected_audience {
+        if claims.aud.as_deref() != Some(expected_aud) {
             return None;
         }
     }
@@ -313,9 +367,14 @@ pub async fn require_admin_auth(
         return authorize_principal(principal, request, next).await;
     }
 
-    // JWT path: verify signature/expiry, then consult the Redis jti blocklist.
+    // JWT path: verify signature/expiry/iss/aud, then consult the Redis jti blocklist.
     if let Some(secret) = auth.jwt_secret.as_deref() {
-        if let Some(claims) = verify_hs256_jwt(&token, secret) {
+        if let Some(claims) = verify_hs256_jwt(
+            &token,
+            secret,
+            auth.jwt_issuer.as_deref(),
+            auth.jwt_audience.as_deref(),
+        ) {
             if let Some(jti) = claims.jti.as_deref() {
                 if auth.is_jti_revoked(jti).await {
                     warn!(jti, "Privileged request rejected: JWT jti is revoked");
@@ -468,7 +527,7 @@ mod tests {
             secret,
             &format!(r#"{{"jti":"abc-123","exp":{exp},"sub":"1","role":"admin"}}"#),
         );
-        let claims = verify_hs256_jwt(&token, secret).expect("valid jwt");
+        let claims = verify_hs256_jwt(&token, secret, None, None).expect("valid jwt");
         assert_eq!(claims.jti.as_deref(), Some("abc-123"));
     }
 
@@ -477,7 +536,26 @@ mod tests {
         let secret = "test-secret";
         let exp = chrono::Utc::now().timestamp() - 10;
         let token = sign_jwt(secret, &format!(r#"{{"jti":"abc-123","exp":{exp}}}"#));
-        assert!(verify_hs256_jwt(&token, secret).is_none());
+        assert!(verify_hs256_jwt(&token, secret, None, None).is_none());
+    }
+
+    #[test]
+    fn verify_hs256_jwt_enforces_issuer_and_audience() {
+        let secret = "test-secret";
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let token = sign_jwt(
+            secret,
+            &format!(r#"{{"jti":"iss-aud","exp":{exp},"iss":"crucible-auth","aud":"crucible-api"}}"#),
+        );
+
+        // Matching issuer and audience
+        assert!(verify_hs256_jwt(&token, secret, Some("crucible-auth"), Some("crucible-api")).is_some());
+
+        // Mismatched issuer
+        assert!(verify_hs256_jwt(&token, secret, Some("wrong-issuer"), Some("crucible-api")).is_none());
+
+        // Mismatched audience
+        assert!(verify_hs256_jwt(&token, secret, Some("crucible-auth"), Some("wrong-audience")).is_none());
     }
 
     #[tokio::test]
@@ -496,5 +574,42 @@ mod tests {
             .unwrap();
         let status = guarded_app(auth).oneshot(request).await.unwrap().status();
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn jwt_admin_token_enforces_configured_issuer_and_audience() {
+        let secret = "jwt-secret";
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let valid_token = sign_jwt(
+            secret,
+            &format!(r#"{{"jti":"valid-jti","exp":{exp},"sub":"9","role":"admin","iss":"crucible-prod","aud":"crucible-admin"}}"#),
+        );
+        let staging_token = sign_jwt(
+            secret,
+            &format!(r#"{{"jti":"staging-jti","exp":{exp},"sub":"9","role":"admin","iss":"crucible-staging","aud":"crucible-admin"}}"#),
+        );
+
+        let auth = AdminAuthState::new()
+            .with_jwt_secret(secret)
+            .with_jwt_issuer("crucible-prod")
+            .with_jwt_audience("crucible-admin");
+
+        // Valid prod token succeeds
+        let req_valid = Request::builder()
+            .uri("/admin")
+            .header(header::AUTHORIZATION, format!("Bearer {valid_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let status_valid = guarded_app(auth.clone()).oneshot(req_valid).await.unwrap().status();
+        assert_eq!(status_valid, StatusCode::OK);
+
+        // Staging token with wrong issuer rejected
+        let req_staging = Request::builder()
+            .uri("/admin")
+            .header(header::AUTHORIZATION, format!("Bearer {staging_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let status_staging = guarded_app(auth).oneshot(req_staging).await.unwrap().status();
+        assert_eq!(status_staging, StatusCode::UNAUTHORIZED);
     }
 }
