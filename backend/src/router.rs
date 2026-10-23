@@ -127,6 +127,8 @@ pub fn build_router(
         .route("/system-stats", get(admin::get_system_stats))
         .route("/maintenance", post(admin::set_maintenance_mode))
         .route("/logs", get(admin::get_admin_logs))
+        .route("/users/suspend", post(admin::suspend_user))
+        .route("/roles/revoke", post(admin::revoke_user_role))
         .route(
             "/users/:id/role",
             put(admin::update_user_role)
