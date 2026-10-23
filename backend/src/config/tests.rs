@@ -166,6 +166,7 @@ fn test_database_to_pool_options() {
         idle_timeout_secs: 30,
         pool_retry_after_secs: 5,
         worker_max_connections: 10,
+        tcp_keepalive_secs: 60,
     };
 
     let _pool_opts = config.to_sqlx_pool_options();
@@ -197,6 +198,7 @@ fn test_sensitive_fields_redacted_in_debug() {
             idle_timeout_secs: 5,
             pool_retry_after_secs: 5,
             worker_max_connections: 10,
+            tcp_keepalive_secs: 60,
         },
         redis: crate::config::RedisConfig {
             url: "redis://:secretpass@host".into(),
