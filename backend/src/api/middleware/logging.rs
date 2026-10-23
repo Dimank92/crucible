@@ -113,12 +113,12 @@ pub async fn logging_middleware(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let version = request.version();
-    let metric_route = request
+    let raw_route = request
         .extensions()
         .get::<MatchedPath>()
         .map(MatchedPath::as_str)
-        .unwrap_or("UNMATCHED")
-        .to_string();
+        .unwrap_or_else(|| uri.path());
+    let metric_route = crate::services::http_metrics::normalize_route(raw_route);
 
     let request_target = sanitize_for_log(&sanitize_uri_for_log(&uri));
     let path = sanitize_for_log(uri.path());
