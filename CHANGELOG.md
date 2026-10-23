@@ -1,3 +1,9 @@
+## [1.36.11](https://github.com/benelabs/crucible/compare/v1.36.10...v1.36.11) (2026-10-23)
+
+### Bug Fixes
+
+* **contracts:** verify soroban wasm export signatures on compile ([#1153](https://github.com/benelabs/crucible/issues/1153)) ([#1338](https://github.com/benelabs/crucible/issues/1338)) ([704710d](https://github.com/benelabs/crucible/commit/704710dd5842fee9c98b6f477af4ce39055662ff))
+
 ## [1.36.10](https://github.com/benelabs/crucible/compare/v1.36.9...v1.36.10) (2026-10-23)
 
 ### Bug Fixes
