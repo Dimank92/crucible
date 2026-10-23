@@ -19,7 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -31,6 +31,7 @@ use crate::services::{
 
 const PUSH_INTERVAL_SECS: u64 = 5;
 const PING_INTERVAL_SECS: u64 = 30;
+const PONG_TIMEOUT_SECS: u64 = 60;
 
 /// Shared state required by the WebSocket handler.
 #[derive(Clone)]
@@ -75,7 +76,7 @@ impl WsState {
         }
 
         if let Some(secret) = self.jwt_secret.as_deref() {
-            if crate::api::middleware::auth::verify_hs256_jwt(token, secret).is_some() {
+            if crate::api::middleware::auth::verify_hs256_jwt(token, secret, None, None).is_some() {
                 return true;
             }
         }
@@ -98,7 +99,9 @@ impl WsState {
         }
         if let Ok(secret) = std::env::var("JWT_SECRET") {
             if !secret.trim().is_empty() {
-                if crate::api::middleware::auth::verify_hs256_jwt(token, secret.trim()).is_some() {
+                if crate::api::middleware::auth::verify_hs256_jwt(token, secret.trim(), None, None)
+                    .is_some()
+                {
                     return true;
                 }
             }
@@ -120,9 +123,15 @@ pub struct DashboardUpdate {
 /// Extract authentication token from headers or query parameters.
 pub fn extract_ws_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
     // 1. Authorization: Bearer <token>
-    if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(auth_val) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         let trimmed = auth_val.trim();
-        if let Some(stripped) = trimmed.strip_prefix("Bearer ").or_else(|| trimmed.strip_prefix("bearer ")) {
+        if let Some(stripped) = trimmed
+            .strip_prefix("Bearer ")
+            .or_else(|| trimmed.strip_prefix("bearer "))
+        {
             let t = stripped.trim();
             if !t.is_empty() {
                 return Some(t.to_string());
@@ -141,7 +150,10 @@ pub fn extract_ws_token(headers: &HeaderMap, query: &HashMap<String, String>) ->
     }
 
     // 3. sec-websocket-protocol header
-    if let Some(proto_val) = headers.get("sec-websocket-protocol").and_then(|v| v.to_str().ok()) {
+    if let Some(proto_val) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+    {
         for part in proto_val.split(',') {
             let t = part.trim();
             if !t.is_empty() && !t.eq_ignore_ascii_case("websocket") {
@@ -203,6 +215,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     let mut ping_ticker = interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut last_pong_received = Instant::now();
+
     loop {
         tokio::select! {
             _ = push_ticker.tick() => {
@@ -228,6 +242,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
             }
 
             _ = ping_ticker.tick() => {
+                // Enforce heartbeat deadline: if client has not replied with pong within timeout, terminate zombie connection
+                if last_pong_received.elapsed() > Duration::from_secs(PONG_TIMEOUT_SECS) {
+                    warn!(
+                        elapsed_secs = last_pong_received.elapsed().as_secs(),
+                        timeout_secs = PONG_TIMEOUT_SECS,
+                        "WebSocket client heartbeat deadline exceeded (missing pong), tearing down zombie connection"
+                    );
+                    break;
+                }
+
                 if sender.send(Message::Ping(vec![].into())).await.is_err() {
                     debug!("WebSocket client disconnected (ping failed), dropping stream");
                     break;
@@ -242,6 +266,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                     }
                     Some(Ok(Message::Pong(_))) => {
                         debug!("Received pong from WebSocket client");
+                        last_pong_received = Instant::now();
                     }
                     Some(Err(e)) => {
                         warn!(error = %e, "WebSocket receive error, tearing down connection");
@@ -383,5 +408,19 @@ mod tests {
 
         let tampered_jwt = format!("{}.tampered", &valid_jwt[..valid_jwt.rfind('.').unwrap()]);
         assert!(!state.is_token_valid(&tampered_jwt).await);
+    }
+
+    #[test]
+    fn test_pong_timeout_configuration() {
+        assert!(PONG_TIMEOUT_SECS > PING_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn test_pong_heartbeat_deadline_detection() {
+        let last_pong = Instant::now() - Duration::from_secs(PONG_TIMEOUT_SECS + 5);
+        assert!(last_pong.elapsed() > Duration::from_secs(PONG_TIMEOUT_SECS));
+
+        let recent_pong = Instant::now();
+        assert!(recent_pong.elapsed() <= Duration::from_secs(PONG_TIMEOUT_SECS));
     }
 }
