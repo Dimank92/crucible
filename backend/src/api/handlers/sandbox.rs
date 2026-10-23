@@ -85,7 +85,13 @@ pub async fn execute_contract(
 fn map_sandbox_error(error: SandboxError) -> ApiError {
     match error {
         SandboxError::InvalidRequest(message) => ApiError::Validation(message),
-        SandboxError::Rejected(message) => ApiError::Validation(message),
+        SandboxError::Rejected(message) => {
+            if message.contains("capacity") || message.contains("concurrency") || message.contains("too many") {
+                ApiError::RateLimited
+            } else {
+                ApiError::Validation(message)
+            }
+        }
         SandboxError::TimedOut(message) => ApiError::Internal(message.to_string()),
         SandboxError::Worker(message) => ApiError::Internal(message),
     }
@@ -170,5 +176,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_returns_too_many_requests_when_capacity_exceeded() {
+        struct RejectingCapacityExecutor;
+        impl ContractExecutor for RejectingCapacityExecutor {
+            fn execute(&self, _execution: PreparedExecution) -> Result<RawExecution, SandboxError> {
+                Err(SandboxError::Rejected("sandbox execution thread pool capacity exceeded; too many concurrent invocations".to_string()))
+            }
+        }
+
+        let service = Arc::new(ContractSandboxService::with_executor(
+            SandboxLimits::default(),
+            Arc::new(RejectingCapacityExecutor),
+        ));
+        let app = routes(service);
+        let payload = json!({
+            "wasm_base64": "AGFzbQEAAAA=",
+            "function": "hello",
+            "args_xdr_base64": []
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }
