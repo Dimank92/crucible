@@ -485,4 +485,43 @@ mod tests {
         };
         assert!(matches!(config.validate(), Err(LockError::InvalidConfig(_))));
     }
+
+    #[tokio::test]
+    async fn heartbeat_loss_triggers_cancellation_token() {
+        let node1 = Arc::new(InMemoryRedisNode::new());
+        let node2 = Arc::new(InMemoryRedisNode::new());
+        let node3 = Arc::new(InMemoryRedisNode::new());
+        let nodes: Vec<Arc<dyn RedisNode>> = vec![node1.clone(), node2.clone(), node3.clone()];
+
+        let mgr = RedlockManager::new(
+            nodes,
+            RedlockConfig {
+                ttl: Duration::from_millis(90),
+                heartbeat_interval: Duration::from_millis(20),
+                acquire_timeout: Duration::from_millis(200),
+                retry_delay: Duration::from_millis(10),
+                ..RedlockConfig::default()
+            },
+        )
+        .unwrap();
+
+        let guard = mgr.acquire("task:cancellation-test").await.unwrap();
+        let cancel_token = guard.cancellation_token();
+        assert!(!cancel_token.is_cancelled());
+
+        // Lose quorum by deleting the lock key from two of the three nodes.
+        let _ = node1
+            .compare_and_del("task:cancellation-test", guard.token())
+            .await;
+        let _ = node2
+            .compare_and_del("task:cancellation-test", guard.token())
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(
+            cancel_token.is_cancelled(),
+            "cancellation token should be cancelled when heartbeat loses quorum"
+        );
+    }
 }
