@@ -51,6 +51,7 @@ pub struct Principal {
     pub id: i32,
     pub address: String,
     pub role: Role,
+    pub organization_id: Option<i32>,
 }
 
 impl Principal {
@@ -60,7 +61,14 @@ impl Principal {
             id,
             address: address.into(),
             role: Role::Admin,
+            organization_id: None,
         }
+    }
+
+    /// Attach an organization / tenant ID to this principal.
+    pub fn with_org(mut self, org_id: i32) -> Self {
+        self.organization_id = Some(org_id);
+        self
     }
 
     fn to_auth_user(&self) -> AuthUser {
@@ -68,6 +76,8 @@ impl Principal {
             id: self.id,
             address: self.address.clone(),
             role: self.role,
+            organization_id: self.organization_id,
+            permissions: Some(self.role.default_permissions()),
         }
     }
 }
@@ -85,6 +95,9 @@ struct JwtClaims {
     /// Optional role claim (`admin`, `user`, …).
     #[serde(default)]
     role: Option<String>,
+    /// Optional organization / tenant ID claim.
+    #[serde(default)]
+    org_id: Option<i32>,
     /// Optional issuer claim (`iss`).
     #[serde(default)]
     iss: Option<String>,
@@ -183,6 +196,7 @@ impl AdminAuthState {
                         id: 2,
                         address: "operator".to_string(),
                         role: Role::User,
+                        organization_id: None,
                     },
                 );
             }
@@ -262,7 +276,10 @@ impl std::fmt::Display for AuthHeaderError {
                 "Malformed Authorization header: contains non-ASCII characters"
             ),
             Self::MissingBearerPrefix => {
-                write!(f, "Malformed Authorization header: missing 'Bearer ' prefix")
+                write!(
+                    f,
+                    "Malformed Authorization header: missing 'Bearer ' prefix"
+                )
             }
             Self::EmptyToken => write!(f, "Malformed Authorization header: empty bearer token"),
         }
@@ -388,6 +405,7 @@ fn principal_from_jwt_claims(claims: &JwtClaims) -> Principal {
         id,
         address,
         role: role_from_claim(claims.role.as_deref()),
+        organization_id: claims.org_id,
     }
 }
 
@@ -514,9 +532,12 @@ mod tests {
     }
 
     fn guarded_app(auth: AdminAuthState) -> Router {
-        Router::new().route("/admin", get(|| async { "ok" })).route_layer(
-            middleware::from_fn_with_state(Arc::new(auth), require_admin_auth),
-        )
+        Router::new()
+            .route("/admin", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                Arc::new(auth),
+                require_admin_auth,
+            ))
     }
 
     async fn response_for(auth_header: Option<HeaderValue>) -> Response {
@@ -540,7 +561,8 @@ mod tests {
         let signing_input = format!("{header}.{payload}");
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(signing_input.as_bytes());
-        let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let sig =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         format!("{signing_input}.{sig}")
     }
 
@@ -566,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_header_with_non_ascii_is_rejected() {
-        let non_ascii_val = HeaderValue::from_bytes(b"Bearer ÿþ").unwrap();
+        let non_ascii_val = HeaderValue::from_bytes(b"Bearer \xFF\xFE\x01\x02").unwrap();
         let resp = response_for(Some(non_ascii_val)).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
@@ -631,7 +653,7 @@ mod tests {
         let req_non_ascii = Request::builder()
             .header(
                 header::AUTHORIZATION,
-                HeaderValue::from_bytes(b"Bearer ").unwrap(),
+                HeaderValue::from_bytes(b"Bearer \x80\x81").unwrap(),
             )
             .body(Body::empty())
             .unwrap();
@@ -691,17 +713,29 @@ mod tests {
         let exp = chrono::Utc::now().timestamp() + 3600;
         let token = sign_jwt(
             secret,
-            &format!(r#"{{"jti":"iss-aud","exp":{exp},"iss":"crucible-auth","aud":"crucible-api"}}"#),
+            &format!(
+                r#"{{"jti":"iss-aud","exp":{exp},"iss":"crucible-auth","aud":"crucible-api"}}"#
+            ),
         );
 
         // Matching issuer and audience
-        assert!(verify_hs256_jwt(&token, secret, Some("crucible-auth"), Some("crucible-api")).is_some());
+        assert!(
+            verify_hs256_jwt(&token, secret, Some("crucible-auth"), Some("crucible-api")).is_some()
+        );
 
         // Mismatched issuer
-        assert!(verify_hs256_jwt(&token, secret, Some("wrong-issuer"), Some("crucible-api")).is_none());
+        assert!(
+            verify_hs256_jwt(&token, secret, Some("wrong-issuer"), Some("crucible-api")).is_none()
+        );
 
         // Mismatched audience
-        assert!(verify_hs256_jwt(&token, secret, Some("crucible-auth"), Some("wrong-audience")).is_none());
+        assert!(verify_hs256_jwt(
+            &token,
+            secret,
+            Some("crucible-auth"),
+            Some("wrong-audience")
+        )
+        .is_none());
     }
 
     #[tokio::test]
@@ -728,11 +762,15 @@ mod tests {
         let exp = chrono::Utc::now().timestamp() + 3600;
         let valid_token = sign_jwt(
             secret,
-            &format!(r#"{{"jti":"valid-jti","exp":{exp},"sub":"9","role":"admin","iss":"crucible-prod","aud":"crucible-admin"}}"#),
+            &format!(
+                r#"{{"jti":"valid-jti","exp":{exp},"sub":"9","role":"admin","iss":"crucible-prod","aud":"crucible-admin"}}"#
+            ),
         );
         let staging_token = sign_jwt(
             secret,
-            &format!(r#"{{"jti":"staging-jti","exp":{exp},"sub":"9","role":"admin","iss":"crucible-staging","aud":"crucible-admin"}}"#),
+            &format!(
+                r#"{{"jti":"staging-jti","exp":{exp},"sub":"9","role":"admin","iss":"crucible-staging","aud":"crucible-admin"}}"#
+            ),
         );
 
         let auth = AdminAuthState::new()
@@ -746,7 +784,11 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {valid_token}"))
             .body(Body::empty())
             .unwrap();
-        let status_valid = guarded_app(auth.clone()).oneshot(req_valid).await.unwrap().status();
+        let status_valid = guarded_app(auth.clone())
+            .oneshot(req_valid)
+            .await
+            .unwrap()
+            .status();
         assert_eq!(status_valid, StatusCode::OK);
 
         // Staging token with wrong issuer rejected
@@ -755,7 +797,11 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {staging_token}"))
             .body(Body::empty())
             .unwrap();
-        let status_staging = guarded_app(auth).oneshot(req_staging).await.unwrap().status();
+        let status_staging = guarded_app(auth)
+            .oneshot(req_staging)
+            .await
+            .unwrap()
+            .status();
         assert_eq!(status_staging, StatusCode::UNAUTHORIZED);
     }
 }
