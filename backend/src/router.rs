@@ -95,6 +95,7 @@ pub fn build_router(
     } = states;
 
     let dlq_coordinator = Arc::new(crate::workers::retry::DlqCoordinator::new(Arc::new(redis_client.clone())));
+    let _ = stellar::init_faucet_pool_with_redis(redis_client.clone());
 
     let contracts_router = Router::new()
         .route("/compile", post(contract_handlers::compile_contract))
