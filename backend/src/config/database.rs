@@ -71,14 +71,19 @@ impl DatabaseConfig {
         }
     }
 
+    /// Returns the connection acquisition timeout, capped between 1 and 5 seconds to prevent request stalls.
+    pub fn acquire_timeout(&self) -> Duration {
+        let bounded_secs = self.connect_timeout_secs.clamp(1, MAX_ACQUIRE_TIMEOUT_SECS);
+        Duration::from_secs(bounded_secs)
+    }
+
     /// Converts the configuration into a ready-to-use SQLx Postgres pool builder.
     pub fn to_sqlx_pool_options(&self) -> PgPoolOptions {
-        let acquire_timeout = Duration::from_secs(self.connect_timeout_secs.clamp(3, 5));
         let keepalive_idle = 60u64;
         PgPoolOptions::new()
             .max_connections(self.max_connections)
             .min_connections(self.min_connections)
-            .acquire_timeout(acquire_timeout)
+            .acquire_timeout(self.acquire_timeout())
             .idle_timeout(Duration::from_secs(self.idle_timeout_secs))
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
@@ -94,12 +99,11 @@ impl DatabaseConfig {
 
     /// Converts the configuration into a dedicated SQLx Postgres pool builder for background batch workers.
     pub fn to_worker_sqlx_pool_options(&self) -> PgPoolOptions {
-        let acquire_timeout = Duration::from_secs(self.connect_timeout_secs.clamp(3, 5));
         let keepalive_idle = 60u64;
         PgPoolOptions::new()
             .max_connections(self.worker_max_connections)
             .min_connections(self.min_connections)
-            .acquire_timeout(acquire_timeout)
+            .acquire_timeout(self.acquire_timeout())
             .idle_timeout(Duration::from_secs(self.idle_timeout_secs))
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
@@ -128,6 +132,7 @@ mod tests {
             connect_timeout_secs: 30,
             idle_timeout_secs: 60,
             pool_retry_after_secs: 5,
+            tcp_keepalive_secs: 60,
         };
 
         // Even though connect_timeout_secs is 30, options should be created without panicking
@@ -141,16 +146,59 @@ mod tests {
         let _opts_mid = config.to_sqlx_pool_options();
     }
 
+    #[test]
+    fn test_default_connect_timeout() {
+        assert_eq!(default_connect_timeout_secs(), 3);
+        assert!(default_connect_timeout_secs() >= 3 && default_connect_timeout_secs() <= 5);
+    }
+
+    #[test]
+    fn test_acquire_timeout_clamping() {
+        let mut config = DatabaseConfig {
+            url: "postgres://localhost/test".to_string(),
+            max_connections: 10,
+            min_connections: 2,
+            connect_timeout_secs: 30,
+            idle_timeout_secs: 300,
+            pool_retry_after_secs: 5,
+            worker_max_connections: 5,
+            tcp_keepalive_secs: 60,
+        };
+        assert_eq!(config.acquire_timeout(), Duration::from_secs(5));
+
+        config.connect_timeout_secs = 3;
+        assert_eq!(config.acquire_timeout(), Duration::from_secs(3));
+
+        config.connect_timeout_secs = 0;
+        assert_eq!(config.acquire_timeout(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_serde_default_connect_timeout() {
+        let json = r#"{
+            "url": "postgres://localhost/test",
+            "max_connections": 10,
+            "min_connections": 2,
+            "idle_timeout_secs": 300
+        }"#;
+        let config: DatabaseConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.connect_timeout_secs, 3);
+        assert_eq!(config.acquire_timeout(), Duration::from_secs(3));
+        assert_eq!(config.pool_retry_after_secs, 5);
+        assert_eq!(config.worker_max_connections, 10);
+    }
+}
+
+impl DatabaseConfig {
     /// Creates PostgreSQL connection options populated from `self.url` with TCP keepalive parameters
     /// configured to prevent intermediate firewalls and NAT gateways from dropping idle connections.
     pub fn to_connect_options(&self) -> Result<PgConnectOptions, sqlx::Error> {
         let keepalive_idle = self.tcp_keepalive_secs.to_string();
-        let opts = PgConnectOptions::from_str(&self.url)?
-            .options([
-                ("tcp_keepalives_idle", keepalive_idle.as_str()),
-                ("tcp_keepalives_interval", "10"),
-                ("tcp_keepalives_count", "5"),
-            ]);
+        let opts = PgConnectOptions::from_str(&self.url)?.options([
+            ("tcp_keepalives_idle", keepalive_idle.as_str()),
+            ("tcp_keepalives_interval", "10"),
+            ("tcp_keepalives_count", "5"),
+        ]);
         Ok(opts)
     }
 
@@ -234,4 +282,3 @@ mod tests {
         assert_eq!(config.worker_max_connections, 10);
     }
 }
-

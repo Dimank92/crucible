@@ -8,7 +8,7 @@ http2_max_concurrent_streams = 100
 [database]
 max_connections = 10
 min_connections = 1
-connect_timeout_secs = 10
+connect_timeout_secs = 3
 idle_timeout_secs = 600
 pool_retry_after_secs = 5
 
