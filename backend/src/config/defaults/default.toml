@@ -3,6 +3,7 @@ host = "0.0.0.0"
 port = 8080
 request_timeout_ms = 30000
 max_connections = 1000
+http2_max_concurrent_streams = 100
 
 [database]
 max_connections = 10
