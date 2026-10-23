@@ -1,3 +1,10 @@
+## [1.36.10](https://github.com/benelabs/crucible/compare/v1.36.9...v1.36.10) (2026-10-23)
+
+### Bug Fixes
+
+* **indexer:** stream historical events through bounded channel with chunked database inserts ([#1179](https://github.com/benelabs/crucible/issues/1179)) ([#1352](https://github.com/benelabs/crucible/issues/1352)) ([d9bd9a5](https://github.com/benelabs/crucible/commit/d9bd9a58c4359f3c0e38620d2d24181a593c8230))
+* **vault:** implement in-memory secret cache with memory zeroization and logging protection ([#1253](https://github.com/benelabs/crucible/issues/1253)) ([#1361](https://github.com/benelabs/crucible/issues/1361)) ([6aff996](https://github.com/benelabs/crucible/commit/6aff996107db82dd2d8b099de800a8d8339c8f15))
+
 ## [1.36.9](https://github.com/benelabs/crucible/compare/v1.36.8...v1.36.9) (2026-10-23)
 
 ### Bug Fixes
