@@ -1,3 +1,16 @@
+## [1.36.2](https://github.com/benelabs/crucible/compare/v1.36.1...v1.36.2) (2026-10-23)
+
+### Bug Fixes
+
+* **auth:** gracefully extract bearer tokens and return RFC 7807 problem details ([#1162](https://github.com/benelabs/crucible/issues/1162)) ([#1204](https://github.com/benelabs/crucible/issues/1204)) ([8b3a7f1](https://github.com/benelabs/crucible/commit/8b3a7f103504b3edd17b90ffbf77f27c16b6a280))
+* **contracts:** enforce cycle detection and 16-layer recursion depth limit on dependency analysis ([#1154](https://github.com/benelabs/crucible/issues/1154)) ([#1206](https://github.com/benelabs/crucible/issues/1206)) ([7746f10](https://github.com/benelabs/crucible/commit/7746f10c7ddab8a87221a3adc732745460d396a2))
+* **db:** ensure database seed queries handle all unique key conflicts idempotently ([#1255](https://github.com/benelabs/crucible/issues/1255)) ([#1261](https://github.com/benelabs/crucible/issues/1261)) ([8cd5295](https://github.com/benelabs/crucible/commit/8cd5295077f86bf6ae39f77082729acc86e07e4d))
+* **feature_flags:** implement atomic in-memory cache and safe Redis outage fallback ([#1180](https://github.com/benelabs/crucible/issues/1180)) ([#1197](https://github.com/benelabs/crucible/issues/1197)) ([b50e647](https://github.com/benelabs/crucible/commit/b50e647171923f56f50ab6f262278b40e421f2c3))
+* **gas_optimizer:** include storage footprint estimates and rent balance projections ([#1159](https://github.com/benelabs/crucible/issues/1159)) ([#1208](https://github.com/benelabs/crucible/issues/1208)) ([e536e46](https://github.com/benelabs/crucible/commit/e536e46927a59e7db308656929f494842af9e4f2))
+* **graphql:** configure query depth limit (max 6) and complexity caps ([#1160](https://github.com/benelabs/crucible/issues/1160)) ([#1207](https://github.com/benelabs/crucible/issues/1207)) ([0559780](https://github.com/benelabs/crucible/commit/05597801cdeaa09fde8ddaef5de66e8bff982d67))
+* **idempotency:** implement atomic key reservation using SET NX PX ([#1166](https://github.com/benelabs/crucible/issues/1166)) ([#1201](https://github.com/benelabs/crucible/issues/1201)) ([d07c071](https://github.com/benelabs/crucible/commit/d07c071328225b42888c173d1f498d0c88add0ae))
+* resolve event ingestion reorg reconciliation redlock drift and dlq quarantine ([#1259](https://github.com/benelabs/crucible/issues/1259)) ([acd5e99](https://github.com/benelabs/crucible/commit/acd5e9916a5365cb3befb8d89b179454f627dc85))
+
 ## [1.36.1](https://github.com/benelabs/crucible/compare/v1.36.0...v1.36.1) (2026-10-23)
 
 ### Bug Fixes
