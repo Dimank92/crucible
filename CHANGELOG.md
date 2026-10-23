@@ -1,3 +1,9 @@
+## [1.36.4](https://github.com/benelabs/crucible/compare/v1.36.3...v1.36.4) (2026-10-23)
+
+### Bug Fixes
+
+* **coverage:** add composite index on contract test coverage historical records ([#1156](https://github.com/benelabs/crucible/issues/1156)) ([#1339](https://github.com/benelabs/crucible/issues/1339)) ([092170e](https://github.com/benelabs/crucible/commit/092170e4ce88249cd367cfc5a86456f27429d01c))
+
 ## [1.36.3](https://github.com/benelabs/crucible/compare/v1.36.2...v1.36.3) (2026-10-23)
 
 ### Bug Fixes
