@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use futures_util::FutureExt;
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::sync::{
@@ -6,7 +7,6 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use futures_util::FutureExt;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::Instrument;
@@ -73,10 +73,12 @@ pub struct TaskExecutor {
     completed_count: Arc<AtomicU64>,
     /// Atomic counter for failed tasks
     failed_count: Arc<AtomicU64>,
+    /// Per-task execution timeout deadline (default: 5 minutes)
+    task_timeout: Duration,
 }
 
 impl TaskExecutor {
-    /// Create a new TaskExecutor with the specified concurrency limit.
+    /// Create a new TaskExecutor with the specified concurrency limit and default 5-minute timeout.
     ///
     /// # Arguments
     ///
@@ -86,13 +88,24 @@ impl TaskExecutor {
     ///
     /// A new TaskExecutor instance
     pub fn new(max_concurrency: usize) -> Self {
+        Self::with_timeout(max_concurrency, Duration::from_secs(300))
+    }
+
+    /// Create a new TaskExecutor with specified concurrency limit and custom task timeout.
+    pub fn with_timeout(max_concurrency: usize, task_timeout: Duration) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
             max_concurrency,
             running_count: Arc::new(AtomicU64::new(0)),
             completed_count: Arc::new(AtomicU64::new(0)),
             failed_count: Arc::new(AtomicU64::new(0)),
+            task_timeout,
         }
+    }
+
+    /// Returns the configured per-task execution timeout.
+    pub fn task_timeout(&self) -> Duration {
+        self.task_timeout
     }
 
     /// Get the current number of running tasks.
@@ -147,6 +160,7 @@ impl TaskExecutor {
         let running_count = self.running_count.clone();
         let completed_count = self.completed_count.clone();
         let failed_count = self.failed_count.clone();
+        let task_timeout = self.task_timeout;
 
         // Increment running count before attempting to acquire permit
         running_count.fetch_add(1, Ordering::Relaxed);
@@ -157,19 +171,28 @@ impl TaskExecutor {
                 // Acquire semaphore permit (waits if necessary)
                 let permit = semaphore.acquire_owned().await;
 
-                // Catch task panics to preserve diagnostic traces and prevent worker crashes
+                // Catch task panics and enforce a bounded timeout.
                 let task_with_catch = AssertUnwindSafe(task).catch_unwind();
 
-                // Execute the task
-                let result = match task_with_catch.await {
-                    Ok(task_res) => task_res,
-                    Err(panic_payload) => {
+                let result = match tokio::time::timeout(task_timeout, task_with_catch).await {
+                    Ok(Ok(task_res)) => task_res,
+                    Ok(Err(panic_payload)) => {
                         let msg = extract_panic_message(&*panic_payload);
                         tracing::error!(
                             panic_message = %msg,
                             "Background task panicked during execution"
                         );
                         Err(AppError::InternalError(format!("Task panicked: {}", msg)))
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            timeout_secs = task_timeout.as_secs(),
+                            "Task execution exceeded timeout deadline"
+                        );
+                        Err(AppError::InternalError(format!(
+                            "Task execution timed out after {:?}",
+                            task_timeout
+                        )))
                     }
                 };
 
@@ -349,7 +372,11 @@ mod tests {
         let res_str = handle_str.await.unwrap();
         assert!(res_str.is_err(), "Panicking task must return error");
         let err_msg = format!("{}", res_str.unwrap_err());
-        assert!(err_msg.contains("critical database invariant failed"), "Panic payload must be preserved: {}", err_msg);
+        assert!(
+            err_msg.contains("critical database invariant failed"),
+            "Panic payload must be preserved: {}",
+            err_msg
+        );
         assert_eq!(executor.failed_count(), 1);
         assert_eq!(executor.running_count(), 0);
 
@@ -363,7 +390,11 @@ mod tests {
         let res_string = handle_string.await.unwrap();
         assert!(res_string.is_err());
         let err_msg2 = format!("{}", res_string.unwrap_err());
-        assert!(err_msg2.contains("out of memory at item 100"), "Formatted panic payload must be preserved: {}", err_msg2);
+        assert!(
+            err_msg2.contains("out of memory at item 100"),
+            "Formatted panic payload must be preserved: {}",
+            err_msg2
+        );
         assert_eq!(executor.failed_count(), 2);
         assert_eq!(executor.running_count(), 0);
     }
@@ -380,11 +411,12 @@ mod tests {
         let _ = panic_handle.await.unwrap();
 
         // Concurrency slot must be immediately freed and available
-        let success_handle = executor.execute(Box::pin(async {
-            Ok(())
-        }));
+        let success_handle = executor.execute(Box::pin(async { Ok(()) }));
         let res = success_handle.await.unwrap();
-        assert!(res.is_ok(), "Subsequent task must succeed without slot leak");
+        assert!(
+            res.is_ok(),
+            "Subsequent task must succeed without slot leak"
+        );
         assert_eq!(executor.completed_count(), 1);
         assert_eq!(executor.failed_count(), 1);
         assert_eq!(executor.running_count(), 0);
@@ -399,5 +431,39 @@ mod tests {
         let app_err = handle_join_error(join_err);
         let err_str = format!("{}", app_err);
         assert!(err_str.contains("fatal worker panic"));
+    }
+
+    #[tokio::test]
+    async fn test_executor_default_timeout() {
+        let executor = TaskExecutor::new(4);
+        assert_eq!(executor.task_timeout(), Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn test_executor_custom_timeout_and_deadline_enforcement() {
+        // Limit concurrency to 1 and timeout to 50ms
+        let executor = TaskExecutor::with_timeout(1, Duration::from_millis(50));
+        assert_eq!(executor.task_timeout(), Duration::from_millis(50));
+
+        // Spawn a task that sleeps longer than timeout (2 seconds)
+        let stuck_handle = executor.execute(Box::pin(async {
+            sleep(Duration::from_secs(2)).await;
+            Ok(())
+        }));
+
+        let stuck_res = stuck_handle.await.unwrap();
+        assert!(stuck_res.is_err(), "Stuck task must fail due to timeout");
+        assert_eq!(executor.failed_count(), 1);
+        assert_eq!(executor.running_count(), 0);
+
+        // Verify concurrency slot is released and not leaked
+        let next_handle = executor.execute(Box::pin(async { Ok(()) }));
+        let next_res = next_handle.await.unwrap();
+        assert!(
+            next_res.is_ok(),
+            "Subsequent task must succeed without slot leak"
+        );
+        assert_eq!(executor.completed_count(), 1);
+        assert_eq!(executor.running_count(), 0);
     }
 }
