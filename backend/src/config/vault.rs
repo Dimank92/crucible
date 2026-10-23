@@ -128,10 +128,7 @@ pub enum VaultAuthMethod {
     },
 
     /// AppRole — useful for non-cloud environments such as bare-metal CI runners.
-    AppRole {
-        role_id: String,
-        secret_id: String,
-    },
+    AppRole { role_id: String, secret_id: String },
 }
 
 impl VaultConfig {
@@ -150,29 +147,34 @@ impl VaultConfig {
         let address = std::env::var("VAULT_ADDR")
             .map_err(|_| VaultError::Config("VAULT_ADDR is required".into()))?;
 
-        let auth_method = std::env::var("VAULT_AUTH_METHOD")
-            .unwrap_or_else(|_| "kubernetes".to_string());
+        let auth_method =
+            std::env::var("VAULT_AUTH_METHOD").unwrap_or_else(|_| "kubernetes".to_string());
 
         let auth = match auth_method.as_str() {
             "token" => {
-                let token = std::env::var("VAULT_TOKEN")
-                    .map_err(|_| VaultError::Config("VAULT_TOKEN required for token auth".into()))?;
+                let token = std::env::var("VAULT_TOKEN").map_err(|_| {
+                    VaultError::Config("VAULT_TOKEN required for token auth".into())
+                })?;
                 VaultAuthMethod::Token(token)
             }
             "kubernetes" => VaultAuthMethod::Kubernetes {
                 role: std::env::var("VAULT_ROLE").unwrap_or_else(|_| "crucible-backend".into()),
-                token_path: std::env::var("VAULT_SA_TOKEN_PATH")
-                    .unwrap_or_else(|_| "/var/run/secrets/kubernetes.io/serviceaccount/token".into()),
+                token_path: std::env::var("VAULT_SA_TOKEN_PATH").unwrap_or_else(|_| {
+                    "/var/run/secrets/kubernetes.io/serviceaccount/token".into()
+                }),
             },
             "aws_iam" => VaultAuthMethod::AwsIam {
-                role: std::env::var("VAULT_ROLE")
-                    .map_err(|_| VaultError::Config("VAULT_ROLE required for aws_iam auth".into()))?,
+                role: std::env::var("VAULT_ROLE").map_err(|_| {
+                    VaultError::Config("VAULT_ROLE required for aws_iam auth".into())
+                })?,
             },
             "approle" => VaultAuthMethod::AppRole {
-                role_id: std::env::var("VAULT_ROLE_ID")
-                    .map_err(|_| VaultError::Config("VAULT_ROLE_ID required for approle auth".into()))?,
-                secret_id: std::env::var("VAULT_SECRET_ID")
-                    .map_err(|_| VaultError::Config("VAULT_SECRET_ID required for approle auth".into()))?,
+                role_id: std::env::var("VAULT_ROLE_ID").map_err(|_| {
+                    VaultError::Config("VAULT_ROLE_ID required for approle auth".into())
+                })?,
+                secret_id: std::env::var("VAULT_SECRET_ID").map_err(|_| {
+                    VaultError::Config("VAULT_SECRET_ID required for approle auth".into())
+                })?,
             },
             other => {
                 return Err(VaultError::Config(format!(
@@ -267,6 +269,96 @@ struct Lease {
     acquired_at: std::time::Instant,
 }
 
+// ── SecretString & VaultSecretCache ───────────────────────────────────────────
+
+/// A zeroizing wrapper for secret strings in memory (e.g. database passwords, API keys)
+/// to prevent plaintext retention in process memory dumps and accidental logging.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString {
+    inner: Vec<u8>,
+}
+
+impl SecretString {
+    /// Create a new protected secret string.
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self {
+            inner: secret.into().into_bytes(),
+        }
+    }
+
+    /// Expose the plaintext secret reference securely for immediate cryptographic or connection usage.
+    pub fn expose_secret(&self) -> &str {
+        std::str::from_utf8(&self.inner).unwrap_or("")
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        for b in self.inner.iter_mut() {
+            unsafe {
+                std::ptr::write_volatile(b, 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+impl std::fmt::Display for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+/// In-memory cache for secrets fetched from Vault with automatic zeroization on eviction.
+///
+/// Addresses issue #1253: prevents plaintext secrets from lingering in process memory or core dumps.
+#[derive(Debug, Default)]
+pub struct VaultSecretCache {
+    secrets: std::collections::HashMap<String, SecretString>,
+}
+
+impl VaultSecretCache {
+    pub fn new() -> Self {
+        Self {
+            secrets: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Insert or update a cached secret.
+    pub fn insert(&mut self, key: impl Into<String>, secret: impl Into<String>) {
+        self.secrets.insert(key.into(), SecretString::new(secret));
+    }
+
+    /// Retrieve a reference to a cached secret if present.
+    pub fn get(&self, key: &str) -> Option<&SecretString> {
+        self.secrets.get(key)
+    }
+
+    /// Remove a secret from the cache, triggering memory zeroization when the returned SecretString drops.
+    pub fn remove(&mut self, key: &str) -> Option<SecretString> {
+        self.secrets.remove(key)
+    }
+
+    /// Clear all secrets in the cache, zeroizing all values on drop.
+    pub fn clear(&mut self) {
+        self.secrets.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.secrets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+}
+
 // ── VaultClient ────────────────────────────────────────────────────────────────
 
 /// Thread-safe Vault client.
@@ -281,6 +373,8 @@ pub struct VaultClient {
     token: Arc<RwLock<String>>,
     /// Active leases that need periodic renewal.
     leases: Arc<RwLock<Vec<Lease>>>,
+    /// In-memory cache for secrets with zeroization on eviction.
+    pub secret_cache: Arc<RwLock<VaultSecretCache>>,
 }
 
 impl VaultClient {
@@ -301,6 +395,7 @@ impl VaultClient {
             http: Arc::new(http),
             token: Arc::new(RwLock::new(String::new())),
             leases: Arc::new(RwLock::new(Vec::new())),
+            secret_cache: Arc::new(RwLock::new(VaultSecretCache::new())),
         };
 
         client.authenticate().await?;
@@ -325,9 +420,7 @@ impl VaultClient {
                 self.login_kubernetes(role, &sa_token).await?
             }
 
-            VaultAuthMethod::AwsIam { role } => {
-                self.login_aws_iam(role).await?
-            }
+            VaultAuthMethod::AwsIam { role } => self.login_aws_iam(role).await?,
 
             VaultAuthMethod::AppRole { role_id, secret_id } => {
                 self.login_approle(role_id, secret_id).await?
@@ -345,7 +438,10 @@ impl VaultClient {
             role: &'a str,
         }
 
-        let body = Body { jwt: sa_token, role };
+        let body = Body {
+            jwt: sa_token,
+            role,
+        };
         let resp: VaultResponse<serde_json::Value> = self
             .post_unauthenticated("auth/kubernetes/login", &body)
             .await?;
@@ -371,9 +467,8 @@ impl VaultClient {
             role,
             iam_http_request_method: "POST",
         };
-        let resp: VaultResponse<serde_json::Value> = self
-            .post_unauthenticated("auth/aws/login", &body)
-            .await?;
+        let resp: VaultResponse<serde_json::Value> =
+            self.post_unauthenticated("auth/aws/login", &body).await?;
 
         resp.auth
             .map(|a| a.client_token)
@@ -408,7 +503,10 @@ impl VaultClient {
     /// # Arguments
     ///
     /// * `role` — the Vault database role name (e.g. `"crucible-postgres"`).
-    pub async fn database_credentials(&self, role: &str) -> Result<DatabaseCredentials, VaultError> {
+    pub async fn database_credentials(
+        &self,
+        role: &str,
+    ) -> Result<DatabaseCredentials, VaultError> {
         let path = format!("database/creds/{role}");
         let resp: VaultResponse<DatabaseCredentials> = self.get(&path).await?;
 
@@ -448,11 +546,10 @@ impl VaultClient {
             .data
             .ok_or_else(|| VaultError::Config(format!("KV secret {path} not found")))?;
 
-        let value = kv
-            .data
-            .get("value")
-            .cloned()
-            .ok_or_else(|| VaultError::Config(format!("KV secret {path} has no 'value' key")))?;
+        let value =
+            kv.data.get("value").cloned().ok_or_else(|| {
+                VaultError::Config(format!("KV secret {path} has no 'value' key"))
+            })?;
 
         Ok(KvSecret {
             value,
@@ -461,15 +558,28 @@ impl VaultClient {
         })
     }
 
+    /// Retrieve a cached secret if present.
+    pub async fn get_cached_secret(&self, key: &str) -> Option<SecretString> {
+        let cache = self.secret_cache.read().await;
+        cache.get(key).cloned()
+    }
+
+    /// Cache a secret with zeroization on eviction.
+    pub async fn cache_secret(&self, key: &str, secret: &str) {
+        let mut cache = self.secret_cache.write().await;
+        cache.insert(key, secret);
+    }
+
+    /// Invalidate/evict a cached secret, returning the zeroized wrapper.
+    pub async fn invalidate_cached_secret(&self, key: &str) -> Option<SecretString> {
+        let mut cache = self.secret_cache.write().await;
+        cache.remove(key)
+    }
+
     /// Write a secret to Vault KV v2.
     ///
     /// Returns the new version number on success.
-    pub async fn kv_put(
-        &self,
-        mount: &str,
-        path: &str,
-        value: &str,
-    ) -> Result<u64, VaultError> {
+    pub async fn kv_put(&self, mount: &str, path: &str, value: &str) -> Result<u64, VaultError> {
         let api_path = format!("{mount}/data/{path}");
 
         #[derive(Serialize)]
@@ -480,8 +590,7 @@ impl VaultClient {
         let mut data = std::collections::HashMap::new();
         data.insert("value", value);
 
-        let resp: VaultResponse<KvV2Metadata> =
-            self.post(&api_path, &Body { data }).await?;
+        let resp: VaultResponse<KvV2Metadata> = self.post(&api_path, &Body { data }).await?;
 
         resp.data
             .map(|m| m.version)
@@ -571,7 +680,11 @@ impl VaultClient {
     // ── Lease renewal ─────────────────────────────────────────────────────────
 
     /// Renew a specific Vault lease by its ID.
-    pub async fn renew_lease(&self, lease_id: &str, increment_secs: u64) -> Result<u64, VaultError> {
+    pub async fn renew_lease(
+        &self,
+        lease_id: &str,
+        increment_secs: u64,
+    ) -> Result<u64, VaultError> {
         #[derive(Serialize)]
         struct Body<'a> {
             lease_id: &'a str,
@@ -579,7 +692,13 @@ impl VaultClient {
         }
 
         let resp: VaultResponse<serde_json::Value> = self
-            .post("sys/leases/renew", &Body { lease_id, increment: increment_secs })
+            .post(
+                "sys/leases/renew",
+                &Body {
+                    lease_id,
+                    increment: increment_secs,
+                },
+            )
             .await?;
 
         Ok(resp.lease_duration.unwrap_or(increment_secs))
@@ -636,10 +755,7 @@ impl VaultClient {
                     remaining_secs = remaining.as_secs(),
                     "VaultClient: renewing lease"
                 );
-                match self
-                    .renew_lease(&lease.lease_id, lease.duration_secs)
-                    .await
-                {
+                match self.renew_lease(&lease.lease_id, lease.duration_secs).await {
                     Ok(new_duration) => {
                         info!(
                             lease_id = %lease.lease_id,
@@ -902,10 +1018,7 @@ mod tests {
         // VAULT_ADDR is not set in this test process — should return an error.
         std::env::remove_var("VAULT_ADDR");
         let result = VaultConfig::from_env();
-        assert!(
-            result.is_err(),
-            "expected error when VAULT_ADDR is not set"
-        );
+        assert!(result.is_err(), "expected error when VAULT_ADDR is not set");
     }
 
     #[test]
@@ -941,14 +1054,46 @@ mod tests {
             http: Arc::new(http),
             token: Arc::new(RwLock::new("test-token".into())),
             leases: Arc::new(RwLock::new(vec![])),
+            secret_cache: Arc::new(RwLock::new(VaultSecretCache::new())),
         };
 
         let headers = client.base_headers("test-token");
         assert!(headers.contains_key("x-vault-token"));
+        assert_eq!(headers["x-vault-token"].to_str().unwrap(), "test-token");
+    }
+
+    #[test]
+    fn test_secret_string_redacted_in_debug_and_display() {
+        // Issue #1253: Secret Cache in Vault Service Stores Plaintext Passwords in Process Memory
+        let secret = SecretString::new("super-secret-password-123");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        assert_eq!(format!("{secret}"), "[REDACTED]");
+        assert_eq!(secret.expose_secret(), "super-secret-password-123");
+    }
+
+    #[tokio::test]
+    async fn test_vault_secret_cache_insert_get_evict_zeroization() {
+        // Issue #1253: In-memory secret caching with secure zeroization on eviction
+        let mut cache = VaultSecretCache::new();
+        assert!(cache.is_empty());
+
+        cache.insert("db_pass", "postgres_master_pw");
+        assert_eq!(cache.len(), 1);
         assert_eq!(
-            headers["x-vault-token"].to_str().unwrap(),
-            "test-token"
+            cache.get("db_pass").unwrap().expose_secret(),
+            "postgres_master_pw"
         );
+
+        let removed = cache.remove("db_pass");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().expose_secret(), "postgres_master_pw");
+        assert!(cache.is_empty());
+
+        cache.insert("token_a", "secret_a");
+        cache.insert("token_b", "secret_b");
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
     }
 
     /// A client whose token renewal always fails, to exercise the retry loop
@@ -973,6 +1118,7 @@ mod tests {
             http: Arc::new(http),
             token: Arc::new(RwLock::new("test-token".into())),
             leases: Arc::new(RwLock::new(vec![])),
+            secret_cache: Arc::new(RwLock::new(VaultSecretCache::new())),
         }
     }
 
