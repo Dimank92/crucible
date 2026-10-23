@@ -1,12 +1,14 @@
 //! HTTP handlers for the contract test coverage reporting API.
 //!
 //! Routes:
-//!   POST /api/v1/coverage          – submit a new JSON coverage snapshot
-//!   POST /api/v1/coverage/lcov     – ingest an uploaded LCOV coverage report (sanitizing SF: paths)
-//!   GET  /api/v1/coverage/:project – retrieve the latest snapshot for a project
+//!   POST /api/v1/coverage                      – submit a new coverage snapshot
+//!   POST /api/v1/coverage/lcov                 – ingest an uploaded LCOV report (sanitizing SF: paths)
+//!   GET  /api/v1/coverage/:project             – retrieve the latest snapshot for a project
+//!   GET  /api/v1/coverage/:contract_id/history – retrieve progression history (composite index backed)
+//!   GET  /api/v1/coverage/progression/:contract_id – alternative path for progression history
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -21,6 +23,12 @@ use crate::services::test_coverage::{NewTestCoverage, TestCoverageService};
 #[derive(Clone)]
 pub struct CoverageState {
     pub service: TestCoverageService,
+}
+
+/// Query parameters for coverage historical queries.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CoverageHistoryQuery {
+    pub limit: Option<i64>,
 }
 
 /// Request payload for uploading an LCOV format coverage report.
@@ -252,10 +260,41 @@ pub async fn get_latest_coverage(
     Ok(Json(record))
 }
 
+/// GET /api/v1/coverage/:contract_id/history
+/// GET /api/v1/coverage/progression/:contract_id
+///
+/// Returns historical coverage records sorted by `created_at DESC`.
+/// Supports `?limit=N` (defaults to 20, clamped 1..=100).
+pub async fn get_coverage_progression(
+    State(state): State<Arc<CoverageState>>,
+    Path(contract_id): Path<String>,
+    Query(query): Query<CoverageHistoryQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let limit = query.limit.unwrap_or(20);
+    let records = state
+        .service
+        .get_coverage_progression(&contract_id, limit)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(records))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn query_deserializes_default() {
+        let q: CoverageHistoryQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn query_deserializes_limit() {
+        let q: CoverageHistoryQuery = serde_json::from_str(r#"{"limit":50}"#).unwrap();
+        assert_eq!(q.limit, Some(50));
+    }
 
     #[test]
     fn test_sanitize_source_path_valid_relative() {
@@ -293,7 +332,10 @@ mod tests {
         let root = Path::new("/workspace/project");
         let result = sanitize_source_path("/etc/shadow", root);
         assert!(matches!(result, Err(AppError::ValidationError(_))));
-        assert!(result.unwrap_err().to_string().contains("outside workspace root"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("outside workspace root"));
     }
 
     #[test]
