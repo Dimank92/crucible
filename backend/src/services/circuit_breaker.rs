@@ -209,6 +209,11 @@ impl CircuitBreaker {
             CircuitState::HalfOpen => "half_open",
         }
     }
+
+    /// Returns the number of failures currently recorded in the sliding window.
+    pub async fn failure_count(&self) -> usize {
+        self.inner.read().await.failure_timestamps.len()
+    }
 }
 
 #[cfg(test)]
@@ -339,5 +344,65 @@ mod tests {
         let result = cb.call(|| async { Ok::<_, String>("ok") }).await;
         assert!(matches!(result, Err(CircuitBreakerError::Open(_))));
         assert_eq!(cb.state_label().await, "open");
+    }
+
+    #[tokio::test]
+    async fn test_fluttering_failures_trip_breaker_sliding_window() {
+        let cb = CircuitBreaker::new("test", fast_config());
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        assert_eq!(cb.failure_count().await, 2);
+
+        // A single success must not reset failure history in Closed state.
+        let ok_res = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(ok_res.is_ok());
+        assert_eq!(cb.failure_count().await, 2);
+
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        assert_eq!(cb.state_label().await, "open");
+
+        let blocked = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(matches!(blocked, Err(CircuitBreakerError::Open(_))));
+    }
+
+    #[tokio::test]
+    async fn test_failures_expire_outside_sliding_window() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 3,
+            recovery_timeout: Duration::from_millis(50),
+            success_threshold: 1,
+            failure_window: Duration::from_millis(60),
+        };
+        let cb = CircuitBreaker::new("test", config);
+
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        assert_eq!(cb.failure_count().await, 2);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let ok_res = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(ok_res.is_ok());
+        assert_eq!(cb.failure_count().await, 0);
+
+        let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        assert_eq!(cb.failure_count().await, 1);
+        assert_eq!(cb.state_label().await, "closed");
+    }
+
+    #[tokio::test]
+    async fn test_recovery_clears_sliding_window() {
+        let cb = CircuitBreaker::new("test", fast_config());
+        for _ in 0..3 {
+            let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        }
+        assert_eq!(cb.state_label().await, "open");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let probe = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(probe.is_ok());
+        assert_eq!(cb.state_label().await, "closed");
+        assert_eq!(cb.failure_count().await, 0);
     }
 }
