@@ -104,6 +104,8 @@ pub fn build_router(
 
     let contracts_router = Router::new()
         .route("/compile", post(contract_handlers::compile_contract))
+        .route("/verify-bytecode", post(contract_handlers::verify_bytecode))
+        .route("/bytecode/verify", post(contract_handlers::verify_bytecode))
         .route(
             "/analyze-dependencies",
             post(contract_handlers::analyze_dependencies),
