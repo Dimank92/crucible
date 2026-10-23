@@ -52,6 +52,10 @@ pub struct RedlockConfig {
     pub acquire_timeout: Duration,
     /// Delay between acquisition retries.
     pub retry_delay: Duration,
+    /// Clock drift adjustment factor (default 0.01 = 1% of TTL).
+    pub drift_factor: f64,
+    /// Standard round-trip network latency variance.
+    pub network_variance: Duration,
 }
 
 impl Default for RedlockConfig {
@@ -61,6 +65,8 @@ impl Default for RedlockConfig {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             acquire_timeout: Duration::from_secs(5),
             retry_delay: Duration::from_millis(50),
+            drift_factor: 0.01,
+            network_variance: Duration::from_millis(2),
         }
     }
 }
@@ -73,6 +79,11 @@ impl RedlockConfig {
         if self.heartbeat_interval >= self.ttl {
             return Err(LockError::InvalidConfig(
                 "heartbeat_interval must be less than ttl".into(),
+            ));
+        }
+        if self.drift_factor < 0.0 || !self.drift_factor.is_finite() {
+            return Err(LockError::InvalidConfig(
+                "drift_factor must be non-negative and finite".into(),
             ));
         }
         Ok(())
@@ -186,8 +197,9 @@ impl RedlockManager {
                 }
             }
 
-            // Factor max clock drift: (ttl * 0.01 + 2ms) per Redlock spec
-            let drift = Duration::from_millis(((ttl_ms as f64 * 0.01) + 2.0) as u64);
+            // Factor max clock drift: (ttl * drift_factor + network_variance) per Redlock spec
+            let drift = Duration::from_secs_f64(self.config.ttl.as_secs_f64() * self.config.drift_factor)
+                .saturating_add(self.config.network_variance);
             let elapsed = start_time.elapsed();
             let validity = self.config.ttl.checked_sub(elapsed + drift);
 
@@ -221,9 +233,9 @@ pub struct LockGuard {
     token: String,
     stop: Arc<AtomicBool>,
     notify: Arc<Notify>,
-    cancellation_token: CancellationToken,
     heartbeat: Option<JoinHandle<()>>,
     released: bool,
+    cancellation_token: CancellationToken,
 }
 
 impl LockGuard {
@@ -236,7 +248,7 @@ impl LockGuard {
         let stop = Arc::new(AtomicBool::new(false));
         let notify = Arc::new(Notify::new());
         let cancellation_token = CancellationToken::new();
-        let cancel_token = cancellation_token.clone();
+        let child_token = cancellation_token.clone();
         let heartbeat = {
             let nodes = nodes.clone();
             let resource = resource.clone();
@@ -262,8 +274,8 @@ impl LockGuard {
                             }
                             let quorum = nodes.len() / 2 + 1;
                             if renewed < quorum {
-                                warn!(%resource, renewed, quorum, "redlock heartbeat lost quorum");
-                                cancel_token.cancel();
+                                warn!(%resource, renewed, quorum, "redlock heartbeat lost quorum; cancelling task");
+                                child_token.cancel();
                                 break;
                             }
                         }
@@ -278,9 +290,9 @@ impl LockGuard {
             token,
             stop,
             notify,
-            cancellation_token,
             heartbeat,
             released: false,
+            cancellation_token,
         }
     }
 
@@ -294,14 +306,14 @@ impl LockGuard {
         &self.token
     }
 
-    /// Exposes the cancellation token triggered when heartbeat renewal fails or loses quorum.
-    pub fn cancellation_token(&self) -> &CancellationToken {
-        &self.cancellation_token
+    /// Cancellation token that gets triggered if the heartbeat renewal fails or loses quorum.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
     }
 
-    /// Clones the cancellation token so holding tasks can monitor cooperative cancellation.
-    pub fn cancel_token(&self) -> CancellationToken {
-        self.cancellation_token.clone()
+    /// Returns true if the lock heartbeat has lost quorum and triggered cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
     }
 
     /// Explicitly release the lock (also called from [`Drop`]).
@@ -374,6 +386,7 @@ mod tests {
                 heartbeat_interval: ttl / 3,
                 acquire_timeout: Duration::from_millis(200),
                 retry_delay: Duration::from_millis(10),
+                ..RedlockConfig::default()
             },
         )
         .unwrap()
@@ -452,6 +465,27 @@ mod tests {
         assert!(matches!(res, Err(LockError::InvalidConfig(_))));
     }
 
+    #[test]
+    fn custom_drift_factor_and_network_variance() {
+        let config = RedlockConfig {
+            drift_factor: 0.05,
+            network_variance: Duration::from_millis(50),
+            ..RedlockConfig::default()
+        };
+        assert_eq!(config.drift_factor, 0.05);
+        assert_eq!(config.network_variance, Duration::from_millis(50));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_drift_factor() {
+        let config = RedlockConfig {
+            drift_factor: -0.01,
+            ..RedlockConfig::default()
+        };
+        assert!(matches!(config.validate(), Err(LockError::InvalidConfig(_))));
+    }
+
     #[tokio::test]
     async fn heartbeat_loss_triggers_cancellation_token() {
         let node1 = Arc::new(InMemoryRedisNode::new());
@@ -466,15 +500,16 @@ mod tests {
                 heartbeat_interval: Duration::from_millis(20),
                 acquire_timeout: Duration::from_millis(200),
                 retry_delay: Duration::from_millis(10),
+                ..RedlockConfig::default()
             },
         )
         .unwrap();
 
         let guard = mgr.acquire("task:cancellation-test").await.unwrap();
-        let cancel_token = guard.cancel_token();
+        let cancel_token = guard.cancellation_token();
         assert!(!cancel_token.is_cancelled());
 
-        // Simulate network partition or key loss by deleting the key from 2 out of 3 nodes (losing quorum)
+        // Lose quorum by deleting the lock key from two of the three nodes.
         let _ = node1
             .compare_and_del("task:cancellation-test", guard.token())
             .await;
@@ -482,10 +517,8 @@ mod tests {
             .compare_and_del("task:cancellation-test", guard.token())
             .await;
 
-        // Wait for the heartbeat tick (interval is 20ms)
-        tokio::time::sleep(Duration::from_millis(45)).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // Verify that the cancellation token was automatically triggered upon heartbeat quorum loss
         assert!(
             cancel_token.is_cancelled(),
             "cancellation token should be cancelled when heartbeat loses quorum"

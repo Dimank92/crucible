@@ -50,6 +50,175 @@ pub struct AnomalyAlert {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Latency percentile summary (p50, p95, p99) for contract executions (#1221).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LatencyPercentiles {
+    pub contract_id: Option<String>,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub sample_count: i64,
+    pub computed_at: DateTime<Utc>,
+}
+
+/// A centroid representation in a t-digest approximate quantile accumulator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Centroid {
+    pub mean: f64,
+    pub weight: f64,
+}
+
+/// T-Digest approximate quantile estimator providing bounded-memory percentile estimation (#1221).
+/// Guarantees O(compression_factor) memory bounds regardless of input sample size.
+#[derive(Debug, Clone)]
+pub struct TDigestEstimator {
+    max_centroids: usize,
+    centroids: Vec<Centroid>,
+    total_weight: f64,
+    unmerged: Vec<Centroid>,
+}
+
+impl Default for TDigestEstimator {
+    fn default() -> Self {
+        Self::new(100)
+    }
+}
+
+impl TDigestEstimator {
+    pub fn new(max_centroids: usize) -> Self {
+        Self {
+            max_centroids: max_centroids.max(10),
+            centroids: Vec::with_capacity(max_centroids),
+            total_weight: 0.0,
+            unmerged: Vec::with_capacity(max_centroids * 2),
+        }
+    }
+
+    /// Adds a single observation sample with unit weight.
+    pub fn add(&mut self, value: f64) {
+        self.add_weighted(value, 1.0);
+    }
+
+    /// Adds a weighted observation.
+    pub fn add_weighted(&mut self, value: f64, weight: f64) {
+        if !value.is_nan() && weight > 0.0 {
+            self.unmerged.push(Centroid { mean: value, weight });
+            if self.unmerged.len() >= self.max_centroids * 2 {
+                self.compress();
+            }
+        }
+    }
+
+    /// Compresses buffered observations and merges adjacent centroids within quantile tolerance.
+    pub fn compress(&mut self) {
+        if self.unmerged.is_empty() {
+            return;
+        }
+
+        let mut all = std::mem::take(&mut self.centroids);
+        all.extend(std::mem::take(&mut self.unmerged));
+        all.sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal));
+
+        let total_w: f64 = all.iter().map(|c| c.weight).sum();
+        self.total_weight = total_w;
+
+        if all.is_empty() {
+            return;
+        }
+
+        let mut merged: Vec<Centroid> = Vec::with_capacity(self.max_centroids);
+        let mut cur_mean = all[0].mean;
+        let mut cur_weight = all[0].weight;
+        let mut cum_weight = 0.0;
+
+        let k = self.max_centroids as f64;
+
+        for c in all.into_iter().skip(1) {
+            let q = (cum_weight + cur_weight / 2.0) / total_w;
+            let max_cluster_weight = (4.0 * total_w * q * (1.0 - q) / k).max(1.0);
+
+            if cur_weight + c.weight <= max_cluster_weight {
+                cur_mean = (cur_mean * cur_weight + c.mean * c.weight) / (cur_weight + c.weight);
+                cur_weight += c.weight;
+            } else {
+                cum_weight += cur_weight;
+                merged.push(Centroid {
+                    mean: cur_mean,
+                    weight: cur_weight,
+                });
+                cur_mean = c.mean;
+                cur_weight = c.weight;
+            }
+        }
+
+        merged.push(Centroid {
+            mean: cur_mean,
+            weight: cur_weight,
+        });
+
+        // Enforce strict memory bound <= max_centroids
+        while merged.len() > self.max_centroids {
+            let mut min_idx = 0;
+            let mut min_diff = f64::MAX;
+            for i in 0..merged.len() - 1 {
+                let diff = (merged[i + 1].mean - merged[i].mean) * (merged[i].weight + merged[i + 1].weight);
+                if diff < min_diff {
+                    min_diff = diff;
+                    min_idx = i;
+                }
+            }
+            let next = merged.remove(min_idx + 1);
+            let combined_w = merged[min_idx].weight + next.weight;
+            merged[min_idx].mean = (merged[min_idx].mean * merged[min_idx].weight + next.mean * next.weight) / combined_w;
+            merged[min_idx].weight = combined_w;
+        }
+
+        self.centroids = merged;
+    }
+
+    /// Estimates the quantile value `q` in `[0.0, 1.0]`.
+    pub fn estimate_quantile(&mut self, q: f64) -> f64 {
+        self.compress();
+
+        if self.centroids.is_empty() {
+            return 0.0;
+        }
+        if self.centroids.len() == 1 {
+            return self.centroids[0].mean;
+        }
+
+        let q = q.clamp(0.0, 1.0);
+        let target_rank = q * self.total_weight;
+
+        let mut cum = 0.0;
+        for i in 0..self.centroids.len() {
+            let c = self.centroids[i];
+            let next_cum = cum + c.weight;
+            if target_rank <= next_cum {
+                if i == 0 {
+                    return c.mean;
+                }
+                let prev = self.centroids[i - 1];
+                let weight_span = c.weight;
+                let fraction = if weight_span > 0.0 {
+                    (target_rank - cum) / weight_span
+                } else {
+                    0.0
+                };
+                return prev.mean + fraction * (c.mean - prev.mean);
+            }
+            cum = next_cum;
+        }
+
+        self.centroids.last().map(|c| c.mean).unwrap_or(0.0)
+    }
+
+    pub fn total_weight(&self) -> f64 {
+        self.total_weight + self.unmerged.iter().map(|c| c.weight).sum::<f64>()
+    }
+}
+
 pub struct AnalyticsAggregator {
     db: PgPool,
     redis: redis::Client,
@@ -101,6 +270,65 @@ impl AnalyticsAggregator {
             })
         } else {
             None
+        }
+    }
+
+    /// Computes accurate percentile latencies using PostgreSQL `percentile_cont` aggregation (#1221).
+    /// Offloads all sorting and memory allocation to the database engine.
+    pub async fn compute_percentiles_pg(
+        &self,
+        contract_id: Option<&str>,
+    ) -> Result<LatencyPercentiles, sqlx::Error> {
+        let row: (i64, Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*)::bigint AS sample_count,
+                percentile_cont(0.50) WITHIN GROUP (ORDER BY compilation_time_ms) AS p50,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY compilation_time_ms) AS p95,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY compilation_time_ms) AS p99
+            FROM build_metrics
+            WHERE ($1::text IS NULL OR project_name = $1)
+            "#,
+        )
+        .bind(contract_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok(LatencyPercentiles {
+            contract_id: contract_id.map(|s| s.to_string()),
+            sample_count: row.0,
+            p50_ms: row.1.unwrap_or(0.0),
+            p95_ms: row.2.unwrap_or(0.0),
+            p99_ms: row.3.unwrap_or(0.0),
+            computed_at: Utc::now(),
+        })
+    }
+
+    /// Computes approximate percentiles (p50, p95, p99) over an iterator of samples using
+    /// the t-digest algorithm with strictly bounded O(1) heap memory (#1221).
+    pub fn compute_approximate_percentiles(
+        contract_id: Option<&str>,
+        samples: impl IntoIterator<Item = f64>,
+    ) -> LatencyPercentiles {
+        let mut digest = TDigestEstimator::default();
+        let mut count = 0i64;
+
+        for val in samples {
+            digest.add(val);
+            count += 1;
+        }
+
+        let p50_ms = digest.estimate_quantile(0.50);
+        let p95_ms = digest.estimate_quantile(0.95);
+        let p99_ms = digest.estimate_quantile(0.99);
+
+        LatencyPercentiles {
+            contract_id: contract_id.map(|s| s.to_string()),
+            p50_ms,
+            p95_ms,
+            p99_ms,
+            sample_count: count,
+            computed_at: Utc::now(),
         }
     }
 
@@ -361,5 +589,52 @@ mod tests {
         assert_eq!(alert.metric, "gas_usage");
         assert_eq!(alert.severity, "HIGH");
         assert!(alert.z_score > 3.0);
+    }
+
+    #[test]
+    fn test_tdigest_percentiles_uniform_distribution() {
+        let samples: Vec<f64> = (1..=1000).map(|i| i as f64).collect();
+        let percentiles = AnalyticsAggregator::compute_approximate_percentiles(Some("contract-1"), samples);
+
+        assert_eq!(percentiles.sample_count, 1000);
+        assert_eq!(percentiles.contract_id, Some("contract-1".to_string()));
+
+        // p50 should be ~500.0 (+/- 5%)
+        assert!((percentiles.p50_ms - 500.0).abs() < 25.0, "p50 was {}", percentiles.p50_ms);
+        // p95 should be ~950.0 (+/- 3%)
+        assert!((percentiles.p95_ms - 950.0).abs() < 25.0, "p95 was {}", percentiles.p95_ms);
+        // p99 should be ~990.0 (+/- 2%)
+        assert!((percentiles.p99_ms - 990.0).abs() < 20.0, "p99 was {}", percentiles.p99_ms);
+    }
+
+    #[test]
+    fn test_tdigest_bounded_memory_under_large_stream() {
+        let mut digest = TDigestEstimator::new(50);
+        for i in 0..100_000 {
+            digest.add((i % 500) as f64);
+        }
+        digest.compress();
+
+        assert!(digest.centroids.len() <= 50);
+        assert_eq!(digest.total_weight, 100_000.0);
+    }
+
+    #[test]
+    fn test_latency_percentiles_serialization() {
+        let lp = LatencyPercentiles {
+            contract_id: Some("C123".to_string()),
+            p50_ms: 12.5,
+            p95_ms: 48.2,
+            p99_ms: 99.1,
+            sample_count: 5000,
+            computed_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&lp).unwrap();
+        let deserialized: LatencyPercentiles = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.p50_ms, 12.5);
+        assert_eq!(deserialized.p95_ms, 48.2);
+        assert_eq!(deserialized.p99_ms, 99.1);
+        assert_eq!(deserialized.sample_count, 5000);
     }
 }
