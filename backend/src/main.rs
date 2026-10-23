@@ -105,7 +105,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let (log_aggregator, log_receiver) = LogAggregator::new();
     let log_aggregator = Arc::new(log_aggregator);
     let sandbox_service = Arc::new(ContractSandboxService::default());
-    let contract_benchmark_service = Arc::new(ContractBenchmarkService::new());
+    let contract_benchmark_service = Arc::new(ContractBenchmarkService::with_db(db_pool.clone()));
     let config_manager = Arc::new(ConfigManager::new(config.clone()));
 
     tokio::spawn(MetricsExporter::run_collector(metrics_exporter.clone()));
