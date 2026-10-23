@@ -1,3 +1,9 @@
+## [1.36.8](https://github.com/benelabs/crucible/compare/v1.36.7...v1.36.8) (2026-10-23)
+
+### Bug Fixes
+
+* **admin:** invalidate sessions, blacklist tokens, and broadcast revocation on user suspension ([#1150](https://github.com/benelabs/crucible/issues/1150)) ([#1347](https://github.com/benelabs/crucible/issues/1347)) ([434b450](https://github.com/benelabs/crucible/commit/434b4507a6670e3b7f4c6551002edc164c498079))
+
 ## [1.36.7](https://github.com/benelabs/crucible/compare/v1.36.6...v1.36.7) (2026-10-23)
 
 ### Bug Fixes
