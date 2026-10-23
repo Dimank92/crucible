@@ -19,16 +19,18 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+use std::collections::VecDeque;
+
 /// Configuration for a circuit breaker.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
-    /// Number of failures within the failure window before opening the circuit.
+    /// Number of failures within the sliding window before opening the circuit.
     pub failure_threshold: u32,
     /// How long to wait in Open state before transitioning to HalfOpen.
     pub recovery_timeout: Duration,
     /// Number of consecutive successes in HalfOpen before closing.
     pub success_threshold: u32,
-    /// Sliding time window during which failures are tracked.
+    /// Sliding time window for failure counting in Closed state.
     pub failure_window: Duration,
 }
 
@@ -46,8 +48,9 @@ impl Default for CircuitBreakerConfig {
 #[derive(Debug)]
 struct CircuitBreakerInner {
     state: CircuitState,
-    failure_timestamps: Vec<Instant>,
+    failure_timestamps: VecDeque<Instant>,
     consecutive_successes: u32,
+    probe_in_flight: bool,
     config: CircuitBreakerConfig,
 }
 
@@ -55,18 +58,22 @@ impl CircuitBreakerInner {
     fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             state: CircuitState::Closed,
-            failure_timestamps: Vec::new(),
+            failure_timestamps: VecDeque::new(),
             consecutive_successes: 0,
+            probe_in_flight: false,
             config,
         }
     }
 
-    fn prune_failures(&mut self, now: Instant) {
-        let window = self.config.failure_window;
-        self.failure_timestamps.retain(|&t| {
-            now.checked_duration_since(t)
-                .map_or(true, |elapsed| elapsed <= window)
-        });
+    fn prune_expired_failures(&mut self, now: Instant) {
+        let cutoff = now.checked_sub(self.config.failure_window).unwrap_or(now);
+        while let Some(&ts) = self.failure_timestamps.front() {
+            if ts < cutoff {
+                self.failure_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     fn is_request_allowed(&mut self) -> bool {
@@ -76,30 +83,42 @@ impl CircuitBreakerInner {
                 if opened_at.elapsed() >= self.config.recovery_timeout {
                     self.state = CircuitState::HalfOpen;
                     self.consecutive_successes = 0;
+                    self.probe_in_flight = true;
                     info!("Circuit breaker transitioning to HalfOpen");
                     true
                 } else {
                     false
                 }
             }
-            CircuitState::HalfOpen => true,
+            CircuitState::HalfOpen => {
+                if !self.probe_in_flight {
+                    self.probe_in_flight = true;
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
     fn record_success(&mut self) {
         match self.state {
             CircuitState::HalfOpen => {
+                self.probe_in_flight = false;
                 self.consecutive_successes += 1;
                 if self.consecutive_successes >= self.config.success_threshold {
                     self.state = CircuitState::Closed;
                     self.failure_timestamps.clear();
+                    self.consecutive_successes = 0;
                     info!("Circuit breaker closed after successful recovery");
                 }
             }
             CircuitState::Closed => {
-                // Prune expired failures from sliding window, but do not
-                // clear unexpired failures on an isolated single success.
-                self.prune_failures(Instant::now());
+                // In Closed state, do not immediately wipe out the failure counter on a single isolated success.
+                // Instead, prune only failures that have aged out of the sliding time window.
+                // This prevents fluttering/flaky services from escaping the threshold.
+                let now = Instant::now();
+                self.prune_expired_failures(now);
             }
             _ => {}
         }
@@ -107,22 +126,25 @@ impl CircuitBreakerInner {
 
     fn record_failure(&mut self) {
         let now = Instant::now();
-        self.prune_failures(now);
-        self.failure_timestamps.push(now);
-
         match self.state {
             CircuitState::Closed => {
-                let failure_count = self.failure_timestamps.len() as u32;
-                if failure_count >= self.config.failure_threshold {
+                self.prune_expired_failures(now);
+                self.failure_timestamps.push_back(now);
+                if self.failure_timestamps.len() >= self.config.failure_threshold as usize {
                     self.state = CircuitState::Open { opened_at: now };
+                    let count = self.failure_timestamps.len();
+                    self.failure_timestamps.clear();
                     warn!(
-                        failures = failure_count,
-                        "Circuit breaker opened after threshold exceeded"
+                        failures = count,
+                        window_secs = self.config.failure_window.as_secs(),
+                        "Circuit breaker opened after threshold exceeded in sliding window"
                     );
                 }
             }
             CircuitState::HalfOpen => {
+                self.probe_in_flight = false;
                 self.state = CircuitState::Open { opened_at: now };
+                self.failure_timestamps.clear();
                 self.consecutive_successes = 0;
                 warn!("Circuit breaker re-opened after probe failure");
             }
@@ -188,11 +210,9 @@ impl CircuitBreaker {
         }
     }
 
-    /// Returns the number of unexpired failures in the sliding window.
+    /// Returns the number of failures currently recorded in the sliding window.
     pub async fn failure_count(&self) -> usize {
-        let mut inner = self.inner.write().await;
-        inner.prune_failures(Instant::now());
-        inner.failure_timestamps.len()
+        self.inner.read().await.failure_timestamps.len()
     }
 }
 
@@ -248,23 +268,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_half_open_limits_concurrency_to_single_probe() {
+        let cb = CircuitBreaker::new("test", fast_config());
+        for _ in 0..3 {
+            let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        }
+        assert_eq!(cb.state_label().await, "open");
+
+        // Wait for recovery timeout
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let cb_clone = cb.clone();
+        let probe_handle = tokio::spawn(async move {
+            cb_clone
+                .call(|| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Ok::<_, String>("probe_ok")
+                })
+                .await
+        });
+
+        // Wait for probe to start and acquire the canary slot
+        started_rx.await.unwrap();
+
+        // While probe is in-flight in HalfOpen, concurrent requests must be rejected
+        let concurrent_result = cb.call(|| async { Ok::<_, String>("concurrent") }).await;
+        assert!(
+            matches!(concurrent_result, Err(CircuitBreakerError::Open(_))),
+            "Concurrent requests in HalfOpen must be rejected while probe is in flight"
+        );
+
+        // Allow probe to finish
+        let _ = release_tx.send(());
+        let probe_result = probe_handle.await.unwrap();
+        assert!(probe_result.is_ok());
+
+        // Probe succeeded, so with success_threshold = 1, circuit is now closed
+        assert_eq!(cb.state_label().await, "closed");
+        let next_result = cb.call(|| async { Ok::<_, String>("next") }).await;
+        assert!(next_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_half_open_probe_failure_reopens_circuit() {
+        let cb = CircuitBreaker::new("test", fast_config());
+        for _ in 0..3 {
+            let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let probe_result = cb.call(|| async { Err::<(), _>("probe_failed") }).await;
+        assert!(matches!(probe_result, Err(CircuitBreakerError::ServiceError(_))));
+
+        // Circuit must immediately be Open again
+        assert_eq!(cb.state_label().await, "open");
+        let next_result = cb.call(|| async { Ok::<_, String>("next") }).await;
+        assert!(matches!(next_result, Err(CircuitBreakerError::Open(_))));
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_catches_fluttering_failures_interspersed_with_successes() {
+        let cb = CircuitBreaker::new("test", fast_config());
+        // Flaky service alternates: fail, success, fail, success, fail
+        let _ = cb.call(|| async { Err::<(), _>("fail 1") }).await;
+        let _ = cb.call(|| async { Ok::<_, String>("success 1") }).await;
+        let _ = cb.call(|| async { Err::<(), _>("fail 2") }).await;
+        let _ = cb.call(|| async { Ok::<_, String>("success 2") }).await;
+        let _ = cb.call(|| async { Err::<(), _>("fail 3") }).await;
+
+        // With sliding window, the circuit breaker opens because 3 failures occurred within the window.
+        let result = cb.call(|| async { Ok::<_, String>("ok") }).await;
+        assert!(matches!(result, Err(CircuitBreakerError::Open(_))));
+        assert_eq!(cb.state_label().await, "open");
+    }
+
+    #[tokio::test]
     async fn test_fluttering_failures_trip_breaker_sliding_window() {
         let cb = CircuitBreaker::new("test", fast_config());
-        // Fail twice
         let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
         let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
         assert_eq!(cb.failure_count().await, 2);
 
-        // A single success should NOT reset failure history in Closed state
+        // A single success must not reset failure history in Closed state.
         let ok_res = cb.call(|| async { Ok::<_, String>("ok") }).await;
         assert!(ok_res.is_ok());
         assert_eq!(cb.failure_count().await, 2);
 
-        // Third failure within the sliding window should trip the breaker to Open
         let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
         assert_eq!(cb.state_label().await, "open");
 
-        // Subsequent call is rejected by open circuit breaker
         let blocked = cb.call(|| async { Ok::<_, String>("ok") }).await;
         assert!(matches!(blocked, Err(CircuitBreakerError::Open(_))));
     }
@@ -279,20 +375,16 @@ mod tests {
         };
         let cb = CircuitBreaker::new("test", config);
 
-        // Two failures
         let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
         let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
         assert_eq!(cb.failure_count().await, 2);
 
-        // Wait for sliding window to expire
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // A success or failure now prunes expired failures
         let ok_res = cb.call(|| async { Ok::<_, String>("ok") }).await;
         assert!(ok_res.is_ok());
         assert_eq!(cb.failure_count().await, 0);
 
-        // A subsequent failure only has count 1, does not trip
         let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
         assert_eq!(cb.failure_count().await, 1);
         assert_eq!(cb.state_label().await, "closed");
@@ -301,16 +393,13 @@ mod tests {
     #[tokio::test]
     async fn test_recovery_clears_sliding_window() {
         let cb = CircuitBreaker::new("test", fast_config());
-        // Trip breaker
         for _ in 0..3 {
             let _ = cb.call(|| async { Err::<(), _>("fail") }).await;
         }
         assert_eq!(cb.state_label().await, "open");
 
-        // Wait for recovery timeout
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        // Successful probe resets circuit to closed and clears failure window
         let probe = cb.call(|| async { Ok::<_, String>("ok") }).await;
         assert!(probe.is_ok());
         assert_eq!(cb.state_label().await, "closed");
