@@ -55,19 +55,71 @@ impl fmt::Debug for DatabaseConfig {
 impl DatabaseConfig {
     /// Converts the configuration into a ready-to-use SQLx Postgres pool builder.
     pub fn to_sqlx_pool_options(&self) -> PgPoolOptions {
+        let acquire_timeout = Duration::from_secs(self.connect_timeout_secs.clamp(3, 5));
+        let keepalive_idle = 60u64;
         PgPoolOptions::new()
             .max_connections(self.max_connections)
             .min_connections(self.min_connections)
-            .acquire_timeout(Duration::from_secs(self.connect_timeout_secs))
+            .acquire_timeout(acquire_timeout)
             .idle_timeout(Duration::from_secs(self.idle_timeout_secs))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    let stmt = format!(
+                        "SET tcp_keepalives_idle = {}; SET tcp_keepalives_interval = 10; SET tcp_keepalives_count = 5",
+                        keepalive_idle
+                    );
+                    sqlx::query(&stmt).execute(conn).await?;
+                    Ok(())
+                })
+            })
     }
 
     /// Converts the configuration into a dedicated SQLx Postgres pool builder for background batch workers.
     pub fn to_worker_sqlx_pool_options(&self) -> PgPoolOptions {
+        let acquire_timeout = Duration::from_secs(self.connect_timeout_secs.clamp(3, 5));
+        let keepalive_idle = 60u64;
         PgPoolOptions::new()
             .max_connections(self.worker_max_connections)
             .min_connections(self.min_connections)
-            .acquire_timeout(Duration::from_secs(self.connect_timeout_secs))
+            .acquire_timeout(acquire_timeout)
             .idle_timeout(Duration::from_secs(self.idle_timeout_secs))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    let stmt = format!(
+                        "SET tcp_keepalives_idle = {}; SET tcp_keepalives_interval = 10; SET tcp_keepalives_count = 5",
+                        keepalive_idle
+                    );
+                    sqlx::query(&stmt).execute(conn).await?;
+                    Ok(())
+                })
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_sqlx_pool_options_clamps_timeout() {
+        let mut config = DatabaseConfig {
+            url: "postgres://localhost/test".to_string(),
+            max_connections: 10,
+            worker_max_connections: 5,
+            min_connections: 1,
+            connect_timeout_secs: 30,
+            idle_timeout_secs: 60,
+            pool_retry_after_secs: 5,
+        };
+
+        // Even though connect_timeout_secs is 30, options should be created without panicking
+        let _opts = config.to_sqlx_pool_options();
+        let _worker_opts = config.to_worker_sqlx_pool_options();
+
+        config.connect_timeout_secs = 1;
+        let _opts_low = config.to_sqlx_pool_options();
+
+        config.connect_timeout_secs = 4;
+        let _opts_mid = config.to_sqlx_pool_options();
     }
 }
