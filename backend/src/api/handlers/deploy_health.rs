@@ -168,6 +168,15 @@ pub struct DeployHealthResponse {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Health probe result for readiness checks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthProbeResult {
+    pub status: String,
+    pub timestamp: DateTime<Utc>,
+    pub database_writable: bool,
+    pub message: String,
+}
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
@@ -280,17 +289,13 @@ pub fn evaluate_deploy_health(
 pub async fn get_deploy_health(
     State(state): State<Arc<DeployHealthState>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let pod_healthy = sqlx::query("SELECT 1")
-        .execute(&state.db)
-        .await
-        .is_ok();
+    let pod_healthy = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
 
     let mut current_ledger = 0u64;
-    if let Ok(Some((last,))) = sqlx::query_as::<_, (i64,)>(
-        "SELECT COALESCE(MAX(last_ledger), 0) FROM ingestion_cursors",
-    )
-    .fetch_optional(&state.db)
-    .await
+    if let Ok(Some((last,))) =
+        sqlx::query_as::<_, (i64,)>("SELECT COALESCE(MAX(last_ledger), 0) FROM ingestion_cursors")
+            .fetch_optional(&state.db)
+            .await
     {
         current_ledger = last.max(0) as u64;
     }
@@ -333,8 +338,10 @@ pub async fn get_deploy_health(
                                     .trim_end_matches(":health")
                             })
                             .to_string();
-                        let is_healthy_raw =
-                            val.get("is_healthy").and_then(|v| v.as_bool()).unwrap_or(true);
+                        let is_healthy_raw = val
+                            .get("is_healthy")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
                         let elapsed_secs = val
                             .get("last_heartbeat")
                             .and_then(|v| {
@@ -563,6 +570,74 @@ pub async fn update_deployment_status(
     Ok(Json::<Deployment>(deployment))
 }
 
+/// `GET /health/ready` — Kubernetes readiness probe with write capability verification.
+///
+/// Performs a lightweight write transaction to verify database is writable, not in read-only
+/// standby mode or experiencing transaction log disk-full conditions.
+#[instrument(skip(state))]
+pub async fn readiness_probe(
+    State(state): State<Arc<DeployHealthState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let mut is_writable = false;
+    let mut error_message = String::new();
+
+    // Attempt a lightweight write transaction to verify database is not in read-only mode
+    let mut tx = match state.db.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            error_message = format!("Failed to begin transaction: {}", e);
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(HealthProbeResult {
+                    status: "unhealthy".to_string(),
+                    timestamp: Utc::now(),
+                    database_writable: false,
+                    message: error_message,
+                }),
+            ));
+        }
+    };
+
+    // Create a temporary table to verify write permissions
+    match sqlx::query("CREATE TEMPORARY TABLE IF NOT EXISTS health_check (id INT)")
+        .execute(&mut *tx)
+        .await
+    {
+        Ok(_) => {
+            is_writable = true;
+            match tx.rollback().await {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to rollback health check transaction: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            error_message = format!("Database write check failed: {}", e);
+            let _ = tx.rollback().await;
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(HealthProbeResult {
+                    status: "unhealthy".to_string(),
+                    timestamp: Utc::now(),
+                    database_writable: false,
+                    message: error_message,
+                }),
+            ));
+        }
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(HealthProbeResult {
+            status: "healthy".to_string(),
+            timestamp: Utc::now(),
+            database_writable: is_writable,
+            message: "Database is writable and operational".to_string(),
+        }),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -583,10 +658,22 @@ mod tests {
 
     #[test]
     fn test_status_from_str_valid() {
-        assert_eq!("pending".parse::<DeployStatus>().unwrap(), DeployStatus::Pending);
-        assert_eq!("healthy".parse::<DeployStatus>().unwrap(), DeployStatus::Healthy);
-        assert_eq!("degraded".parse::<DeployStatus>().unwrap(), DeployStatus::Degraded);
-        assert_eq!("failed".parse::<DeployStatus>().unwrap(), DeployStatus::Failed);
+        assert_eq!(
+            "pending".parse::<DeployStatus>().unwrap(),
+            DeployStatus::Pending
+        );
+        assert_eq!(
+            "healthy".parse::<DeployStatus>().unwrap(),
+            DeployStatus::Healthy
+        );
+        assert_eq!(
+            "degraded".parse::<DeployStatus>().unwrap(),
+            DeployStatus::Degraded
+        );
+        assert_eq!(
+            "failed".parse::<DeployStatus>().unwrap(),
+            DeployStatus::Failed
+        );
     }
 
     #[test]
@@ -757,7 +844,8 @@ mod tests {
 
     #[test]
     fn test_evaluate_deploy_health_all_healthy() {
-        let res = evaluate_deploy_health(true, sample_healthy_ingestion(), sample_healthy_workers());
+        let res =
+            evaluate_deploy_health(true, sample_healthy_ingestion(), sample_healthy_workers());
         assert_eq!(res.status, DeployStatus::Healthy);
         assert!(res.pod_healthy);
         assert!(res.workers_healthy);
@@ -774,7 +862,10 @@ mod tests {
         let res = evaluate_deploy_health(true, ingestion, sample_healthy_workers());
         assert_eq!(res.status, DeployStatus::Degraded);
         assert!(!res.ingestion_healthy);
-        assert!(res.message.unwrap().contains("Ingestion lag exceeds threshold"));
+        assert!(res
+            .message
+            .unwrap()
+            .contains("Ingestion lag exceeds threshold"));
     }
 
     #[test]
@@ -790,7 +881,10 @@ mod tests {
         let res = evaluate_deploy_health(true, ingestion, sample_healthy_workers());
         assert_eq!(res.status, DeployStatus::Failed);
         assert!(!res.ingestion_healthy);
-        assert!(res.message.unwrap().contains("Ingestion lag is critical: 3500 ledgers behind network tip"));
+        assert!(res
+            .message
+            .unwrap()
+            .contains("Ingestion lag is critical: 3500 ledgers behind network tip"));
     }
 
     #[test]
@@ -813,20 +907,28 @@ mod tests {
         ingestion.queue_backlog = 1500; // > 1000 max
 
         let res = evaluate_deploy_health(true, ingestion, sample_healthy_workers());
-        assert!(res.message.unwrap().contains("Ingestion queue backlog high"));
+        assert!(res
+            .message
+            .unwrap()
+            .contains("Ingestion queue backlog high"));
     }
 
     #[test]
     fn test_evaluate_deploy_health_pod_storage_failure() {
-        let res = evaluate_deploy_health(false, sample_healthy_ingestion(), sample_healthy_workers());
+        let res =
+            evaluate_deploy_health(false, sample_healthy_ingestion(), sample_healthy_workers());
         assert_eq!(res.status, DeployStatus::Failed);
         assert!(!res.pod_healthy);
-        assert!(res.message.unwrap().contains("Pod storage connectivity degraded"));
+        assert!(res
+            .message
+            .unwrap()
+            .contains("Pod storage connectivity degraded"));
     }
 
     #[test]
     fn test_deploy_health_response_serialization() {
-        let res = evaluate_deploy_health(true, sample_healthy_ingestion(), sample_healthy_workers());
+        let res =
+            evaluate_deploy_health(true, sample_healthy_ingestion(), sample_healthy_workers());
         let json = serde_json::to_string(&res).unwrap();
         assert!(json.contains("\"status\":\"healthy\""));
         assert!(json.contains("\"podHealthy\":true"));
