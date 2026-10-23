@@ -84,26 +84,26 @@ impl Principal {
 
 /// Claims extracted from a verified HS256 JWT access token.
 #[derive(Debug, Clone, Deserialize)]
-struct JwtClaims {
+pub(crate) struct JwtClaims {
     /// JWT ID — used for Redis revocation lookups.
-    jti: Option<String>,
+    pub(crate) jti: Option<String>,
     /// Expiration as seconds since the Unix epoch.
-    exp: Option<i64>,
+    pub(crate) exp: Option<i64>,
     /// Optional subject / user id.
     #[serde(default)]
-    sub: Option<String>,
+    pub(crate) sub: Option<String>,
     /// Optional role claim (`admin`, `user`, …).
     #[serde(default)]
-    role: Option<String>,
+    pub(crate) role: Option<String>,
     /// Optional organization / tenant ID claim.
     #[serde(default)]
-    org_id: Option<i32>,
+    pub(crate) org_id: Option<i32>,
     /// Optional issuer claim (`iss`).
     #[serde(default)]
-    iss: Option<String>,
+    pub(crate) iss: Option<String>,
     /// Optional audience claim (`aud`).
     #[serde(default)]
-    aud: Option<String>,
+    pub(crate) aud: Option<String>,
 }
 
 /// Registry mapping bearer tokens to the principals they authenticate, plus
@@ -252,6 +252,31 @@ impl AdminAuthState {
             }
         }
     }
+
+    /// Check whether a token is valid (either as a registered static token or valid JWT).
+    pub async fn is_token_valid(&self, token: &str) -> bool {
+        if self.tokens.contains_key(token) {
+            return true;
+        }
+
+        if let Some(secret) = self.jwt_secret.as_deref() {
+            if let Some(claims) = verify_hs256_jwt(
+                token,
+                secret,
+                self.jwt_issuer.as_deref(),
+                self.jwt_audience.as_deref(),
+            ) {
+                if let Some(jti) = claims.jti.as_deref() {
+                    if self.is_jti_revoked(jti).await {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 /// Errors that can occur when extracting or validating the `Authorization` header.
@@ -332,7 +357,7 @@ fn b64url_decode(input: &str) -> Option<Vec<u8>> {
 
 /// Verify an HS256 JWT and return its claims, or `None` on any failure.
 /// When `expected_issuer` or `expected_audience` are specified, matching claims are strictly required.
-fn verify_hs256_jwt(
+pub(crate) fn verify_hs256_jwt(
     token: &str,
     secret: &str,
     expected_issuer: Option<&str>,

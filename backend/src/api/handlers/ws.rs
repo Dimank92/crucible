@@ -3,21 +3,27 @@
 //! Clients connect to `/api/v1/ws/dashboard` and receive a JSON push every
 //! `PUSH_INTERVAL_SECS` seconds containing the latest dashboard metrics.
 //! The connection is kept alive with periodic pings.
+//!
+//! Handshake upgrade requires authentication via bearer token, session token header,
+//! or query parameters (`token`, `session_token`, `access_token`, `jwt`).
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+use crate::api::middleware::auth::AdminAuthState;
 use crate::services::{
     error_recovery::ErrorManager,
     sys_metrics::{MetricsExporter, SystemMetrics},
@@ -32,6 +38,77 @@ const PONG_TIMEOUT_SECS: u64 = 60;
 pub struct WsState {
     pub metrics_exporter: Arc<MetricsExporter>,
     pub error_manager: Arc<ErrorManager>,
+    pub auth_state: Option<Arc<AdminAuthState>>,
+    pub jwt_secret: Option<String>,
+}
+
+impl WsState {
+    pub fn new(metrics_exporter: Arc<MetricsExporter>, error_manager: Arc<ErrorManager>) -> Self {
+        Self {
+            metrics_exporter,
+            error_manager,
+            auth_state: None,
+            jwt_secret: None,
+        }
+    }
+
+    pub fn with_auth_state(mut self, auth_state: Arc<AdminAuthState>) -> Self {
+        self.auth_state = Some(auth_state);
+        self
+    }
+
+    pub fn with_jwt_secret(mut self, secret: impl Into<String>) -> Self {
+        self.jwt_secret = Some(secret.into());
+        self
+    }
+
+    /// Check whether a candidate token is valid.
+    pub async fn is_token_valid(&self, token: &str) -> bool {
+        let token = token.trim();
+        if token.is_empty() {
+            return false;
+        }
+
+        if let Some(auth) = &self.auth_state {
+            if auth.is_token_valid(token).await {
+                return true;
+            }
+        }
+
+        if let Some(secret) = self.jwt_secret.as_deref() {
+            if crate::api::middleware::auth::verify_hs256_jwt(token, secret, None, None).is_some() {
+                return true;
+            }
+        }
+
+        // Fallback to environment variables
+        if let Ok(admin_token) = std::env::var("ADMIN_API_TOKEN") {
+            if !admin_token.trim().is_empty() && token == admin_token.trim() {
+                return true;
+            }
+        }
+        if let Ok(op_token) = std::env::var("OPERATOR_API_TOKEN") {
+            if !op_token.trim().is_empty() && token == op_token.trim() {
+                return true;
+            }
+        }
+        if let Ok(ws_token) = std::env::var("WS_AUTH_TOKEN") {
+            if !ws_token.trim().is_empty() && token == ws_token.trim() {
+                return true;
+            }
+        }
+        if let Ok(secret) = std::env::var("JWT_SECRET") {
+            if !secret.trim().is_empty() {
+                if crate::api::middleware::auth::verify_hs256_jwt(token, secret.trim(), None, None)
+                    .is_some()
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 /// The payload pushed to each connected client.
@@ -43,11 +120,87 @@ pub struct DashboardUpdate {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-/// Axum handler — upgrades the HTTP connection to WebSocket.
+/// Extract authentication token from headers or query parameters.
+pub fn extract_ws_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
+    // 1. Authorization: Bearer <token>
+    if let Some(auth_val) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        let trimmed = auth_val.trim();
+        if let Some(stripped) = trimmed
+            .strip_prefix("Bearer ")
+            .or_else(|| trimmed.strip_prefix("bearer "))
+        {
+            let t = stripped.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        } else if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // 2. x-session-token header
+    if let Some(session_val) = headers.get("x-session-token").and_then(|v| v.to_str().ok()) {
+        let t = session_val.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+
+    // 3. sec-websocket-protocol header
+    if let Some(proto_val) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+    {
+        for part in proto_val.split(',') {
+            let t = part.trim();
+            if !t.is_empty() && !t.eq_ignore_ascii_case("websocket") {
+                return Some(t.to_string());
+            }
+        }
+    }
+
+    // 4. Query parameters: token, session_token, access_token, jwt
+    for key in &["token", "session_token", "access_token", "jwt"] {
+        if let Some(val) = query.get(*key) {
+            let t = val.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Axum handler — validates auth credentials and upgrades HTTP connection to WebSocket.
 pub async fn ws_dashboard_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     State(state): State<Arc<WsState>>,
-) -> impl IntoResponse {
+) -> Response {
+    let token = extract_ws_token(&headers, &query);
+    let Some(token) = token else {
+        warn!("WebSocket handshake rejected: missing authorization token");
+        return crate::api::errors::make_error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Authentication required: provide a Bearer token or token query parameter",
+        );
+    };
+
+    if !state.is_token_valid(&token).await {
+        warn!("WebSocket handshake rejected: invalid or expired authentication token");
+        return crate::api::errors::make_error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Invalid authentication credentials",
+        );
+    }
+
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -132,6 +285,32 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::middleware::auth::Principal;
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
+
+    fn create_test_jwt(secret: &str, sub: &str, exp: i64) -> String {
+        let header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+        let payload = serde_json::json!({
+            "sub": sub,
+            "role": "admin",
+            "exp": exp,
+            "jti": "ws-test-jti"
+        })
+        .to_string();
+
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let signing_input = format!("{}.{}", b64(header.as_bytes()), b64(payload.as_bytes()));
+
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(signing_input.as_bytes());
+        let signature = b64(&mac.finalize().into_bytes());
+
+        format!("{signing_input}.{signature}")
+    }
 
     #[test]
     fn test_dashboard_update_serialization() {
@@ -145,6 +324,90 @@ mod tests {
         let json = serde_json::to_string(&update).unwrap();
         assert!(json.contains("dashboard_update"));
         assert!(json.contains("active_errors"));
+    }
+
+    #[test]
+    fn test_extract_ws_token_from_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer secret_token_123".parse().unwrap(),
+        );
+        let query = HashMap::new();
+
+        let token = extract_ws_token(&headers, &query);
+        assert_eq!(token.as_deref(), Some("secret_token_123"));
+    }
+
+    #[test]
+    fn test_extract_ws_token_from_query_params() {
+        let headers = HeaderMap::new();
+        let mut query = HashMap::new();
+        query.insert("token".to_string(), "query_token_abc".to_string());
+
+        let token = extract_ws_token(&headers, &query);
+        assert_eq!(token.as_deref(), Some("query_token_abc"));
+
+        let mut session_query = HashMap::new();
+        session_query.insert("session_token".to_string(), "sess_xyz".to_string());
+        assert_eq!(
+            extract_ws_token(&headers, &session_query).as_deref(),
+            Some("sess_xyz")
+        );
+    }
+
+    #[test]
+    fn test_extract_ws_token_from_custom_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-token", "custom_session_456".parse().unwrap());
+        let query = HashMap::new();
+
+        assert_eq!(
+            extract_ws_token(&headers, &query).as_deref(),
+            Some("custom_session_456")
+        );
+
+        let mut proto_headers = HeaderMap::new();
+        proto_headers.insert(
+            "sec-websocket-protocol",
+            "websocket, proto_token_789".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_ws_token(&proto_headers, &query).as_deref(),
+            Some("proto_token_789")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_state_validates_static_token() {
+        let metrics = Arc::new(MetricsExporter::new());
+        let error_manager = Arc::new(ErrorManager::new());
+        let mut auth = AdminAuthState::new();
+        auth.insert_token("valid_static_key", Principal::admin(1, "admin"));
+
+        let state = WsState::new(metrics, error_manager).with_auth_state(Arc::new(auth));
+
+        assert!(state.is_token_valid("valid_static_key").await);
+        assert!(!state.is_token_valid("wrong_key").await);
+    }
+
+    #[tokio::test]
+    async fn test_ws_state_validates_jwt() {
+        let metrics = Arc::new(MetricsExporter::new());
+        let error_manager = Arc::new(ErrorManager::new());
+        let secret = "super-secret-jwt-key";
+        let state = WsState::new(metrics, error_manager).with_jwt_secret(secret);
+
+        let future_exp = chrono::Utc::now().timestamp() + 3600;
+        let valid_jwt = create_test_jwt(secret, "admin-user", future_exp);
+        assert!(state.is_token_valid(&valid_jwt).await);
+
+        let past_exp = chrono::Utc::now().timestamp() - 3600;
+        let expired_jwt = create_test_jwt(secret, "admin-user", past_exp);
+        assert!(!state.is_token_valid(&expired_jwt).await);
+
+        let tampered_jwt = format!("{}.tampered", &valid_jwt[..valid_jwt.rfind('.').unwrap()]);
+        assert!(!state.is_token_valid(&tampered_jwt).await);
     }
 
     #[test]

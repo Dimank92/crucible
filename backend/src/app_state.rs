@@ -75,6 +75,8 @@ pub fn build_application_states(
     let websocket = Arc::new(WsState {
         metrics_exporter: services.metrics_exporter.clone(),
         error_manager: services.error_manager.clone(),
+        auth_state: Some(Arc::new(crate::api::middleware::auth::AdminAuthState::from_env())),
+        jwt_secret: std::env::var("JWT_SECRET").ok().filter(|s| !s.trim().is_empty()),
     });
 
     let audit = Arc::new(AuditService::new(db_pool, Arc::new(redis_client)));
