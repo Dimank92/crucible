@@ -1,3 +1,9 @@
+## [1.36.6](https://github.com/benelabs/crucible/compare/v1.36.5...v1.36.6) (2026-10-23)
+
+### Bug Fixes
+
+* **idempotency:** atomically update record from processing to completed ([#1165](https://github.com/benelabs/crucible/issues/1165)) ([#1342](https://github.com/benelabs/crucible/issues/1342)) ([6b5785e](https://github.com/benelabs/crucible/commit/6b5785e0a7b85de329a8d78d552fddc3fbd20ab8))
+
 ## [1.36.5](https://github.com/benelabs/crucible/compare/v1.36.4...v1.36.5) (2026-10-23)
 
 ### Bug Fixes
