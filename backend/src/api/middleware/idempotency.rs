@@ -91,7 +91,8 @@ pub async fn idempotency_middleware(
                     // Another concurrent request is actively executing with this key.
                     if start_time.elapsed() >= MAX_WAIT_TIME {
                         return Err(AppError::Conflict(
-                            "A request with this idempotency key is currently being processed".to_string(),
+                            "A request with this idempotency key is currently being processed"
+                                .to_string(),
                         ));
                     }
                     tokio::time::sleep(POLL_INTERVAL).await;
@@ -142,12 +143,13 @@ pub async fn idempotency_middleware(
     }
 
     let (parts, body) = response.into_parts();
-    let body_bytes = to_bytes(body, usize::MAX)
-        .await
-        .map_err(|error| AppError::InternalError(format!("failed to read response body: {error}")))?;
+    let body_bytes = to_bytes(body, usize::MAX).await.map_err(|error| {
+        AppError::InternalError(format!("failed to read response body: {error}"))
+    })?;
 
-    let body_text = String::from_utf8(body_bytes.to_vec())
-        .map_err(|error| AppError::InternalError(format!("response body was not UTF-8: {error}")))?;
+    let body_text = String::from_utf8(body_bytes.to_vec()).map_err(|error| {
+        AppError::InternalError(format!("response body was not UTF-8: {error}"))
+    })?;
 
     let completed_record = serde_json::to_string(&IdempotencyRecord::Completed {
         body: body_text.clone(),
@@ -165,10 +167,9 @@ pub async fn idempotency_middleware(
         .await?;
 
     let mut rebuilt = Response::from_parts(parts, Body::from(body_text));
-    rebuilt.headers_mut().insert(
-        "x-idempotency-replayed",
-        HeaderValue::from_static("false"),
-    );
+    rebuilt
+        .headers_mut()
+        .insert("x-idempotency-replayed", HeaderValue::from_static("false"));
     Ok(rebuilt)
 }
 
@@ -178,10 +179,22 @@ fn build_cached_response(body_text: &str, status: StatusCode) -> Response {
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    response.headers_mut().insert(
-        "x-idempotency-replayed",
-        HeaderValue::from_static("true"),
-    );
+    response
+        .headers_mut()
+        .insert("x-idempotency-replayed", HeaderValue::from_static("true"));
+    response
+}
+
+#[allow(dead_code)]
+fn build_replayed_response(cached_response: String) -> Response {
+    let mut response = Response::new(Body::from(cached_response));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+        .headers_mut()
+        .insert("x-idempotency-replayed", HeaderValue::from_static("true"));
     response
 }
 
@@ -302,5 +315,29 @@ mod tests {
 
         assert_eq!(first_body, second_body);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn test_build_replayed_response_headers() {
+        let payload = r#"{"status":"ok"}"#.to_string();
+        let response = build_replayed_response(payload);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            response.headers().get("x-idempotency-replayed").unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn test_conflict_error_status_code() {
+        use axum::response::IntoResponse;
+        let err = AppError::Conflict(
+            "A request with this idempotency key is currently being processed".into(),
+        );
+        let res = err.into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 }
