@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.120.0
+      - uses: dtolnay/rust-toolchain@1.91.0
       - run: cargo check --workspace --exclude backend
 
   test:
@@ -52,5 +52,5 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace --exclude backend --features full
+      - run: cargo test --workspace --exclude backend --all-features
 
