@@ -990,8 +990,10 @@ mod tests {
         let err_msg = diagnostics(&err);
         assert!(err_msg.contains("#[fixture] takes no arguments other than `requires = [..]`"));
         assert!(err_msg.contains("note: expected syntax is `#[fixture(requires = [..])]`"));
+    }
 
-fn test_quickcheck_pattern_destructuring() {
+    #[test]
+    fn test_quickcheck_pattern_destructuring() {
         let input: syn::ItemFn = syn::parse_quote! {
             fn test_prop(mut x: u32, ref y: u32, (a, b): (u32, u32)) {
                 x += 1;
@@ -1021,7 +1023,6 @@ fn test_quickcheck_pattern_destructuring() {
             expanded_str.contains("let (a , b) = __arg_2 ;"),
             "expanded tokens missing let (a, b): {expanded_str}"
         );
-
     }
 }
 
